@@ -162,27 +162,201 @@ export async function tgSendPhoto(
 }
 
 export async function tgDownloadSmallFileToScratch(fileId: string, targetRelativePath: string): Promise<string | null> {
+  const res = await tgDownloadBotFileToScratch(fileId, targetRelativePath, 15 * 1024 * 1024);
+  return res ? res.filePath : null;
+}
+
+/**
+ * Streams a Telegram file (up to 20 MB Bot API limit) directly to scratch disk
+ * so small videos/photos work even when MTProto FastSocket is not connected.
+ */
+export async function tgDownloadBotFileToScratch(
+  fileId: string,
+  targetRelativePath: string,
+  maxBytes = 20 * 1024 * 1024,
+  onProgress?: (downloadedBytes: number, totalBytes: number, speedMbps: number) => void
+): Promise<{ filePath: string; bytesWritten: number; throughputMbps: number } | null> {
   const token = getTelegramBotToken();
   if (!token) return null;
 
-  const info = await callTelegramApi<{ file_path?: string }>('getFile', { file_id: fileId }, 10_000);
+  const info = await callTelegramApi<{ file_path?: string; file_size?: number }>('getFile', { file_id: fileId }, 12_000);
   const filePath = info.result?.file_path;
   if (!info.ok || !filePath) return null;
+  if (info.result?.file_size && info.result.file_size > maxBytes) return null;
 
+  const confined = resolveConfinedScratchPath(targetRelativePath);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20_000);
+  const timer = setTimeout(() => controller.abort(), 90_000);
+  const started = Date.now();
+  let bytesWritten = 0;
+
   try {
     const dlRes = await fetch(`https://api.telegram.org/file/bot${token}/${filePath}`, {
       signal: controller.signal,
     });
-    if (!dlRes.ok) return null;
-    const arr = await dlRes.arrayBuffer();
-    if (arr.byteLength < 64 || arr.byteLength > 15 * 1024 * 1024) return null;
-    const confined = resolveConfinedScratchPath(targetRelativePath);
-    fs.writeFileSync(confined, Buffer.from(arr));
-    return confined;
+    if (!dlRes.ok || !dlRes.body) return null;
+
+    const totalExpected = Number(dlRes.headers.get('content-length') || info.result?.file_size || 0);
+    const out = fs.createWriteStream(confined);
+    const reader = dlRes.body.getReader();
+    let lastReport = 0;
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value || value.byteLength === 0) continue;
+        bytesWritten += value.byteLength;
+        if (bytesWritten > maxBytes) {
+          throw new Error('El archivo excede el límite de descarga directa de Bot API.');
+        }
+        if (!out.write(Buffer.from(value))) {
+          await new Promise<void>((resolve) => out.once('drain', resolve));
+        }
+        const now = Date.now();
+        if (onProgress && (now - lastReport >= 700 || (totalExpected > 0 && bytesWritten >= totalExpected))) {
+          lastReport = now;
+          const elapsed = Math.max(0.1, (now - started) / 1000);
+          onProgress(bytesWritten, totalExpected || bytesWritten, Number(((bytesWritten / 1024 ** 2) / elapsed).toFixed(2)));
+        }
+      }
+      await new Promise<void>((resolve, reject) => {
+        out.end(() => resolve());
+        out.on('error', reject);
+      });
+    } catch (err) {
+      out.destroy();
+      try {
+        if (fs.existsSync(confined)) fs.rmSync(confined, { force: true });
+      } catch {
+        // Ignore cleanup failure
+      }
+      throw err;
+    }
+
+    if (bytesWritten < 64) {
+      try {
+        if (fs.existsSync(confined)) fs.rmSync(confined, { force: true });
+      } catch {
+        // Ignore
+      }
+      return null;
+    }
+    const elapsedSec = Math.max(0.1, (Date.now() - started) / 1000);
+    return {
+      filePath: confined,
+      bytesWritten,
+      throughputMbps: Number(((bytesWritten / 1024 ** 2) / elapsedSec).toFixed(2)),
+    };
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const PRIVATE_IP_OR_HOST_REGEX =
+  /^(localhost|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|169\.254\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|0\.0\.0\.0|\[::1\]|.*\.local)$/i;
+
+/**
+ * SSRF-safe streaming direct HTTP/HTTPS video downloader to scratch disk for /url command.
+ */
+export async function downloadDirectUrlToScratch(params: {
+  url: string;
+  targetRelativePath: string;
+  maxBytes: number;
+  onProgress?: (downloadedBytes: number, totalBytes: number, speedMbps: number) => void;
+}): Promise<{ filePath: string; bytesWritten: number; throughputMbps: number; detectedFileName: string }> {
+  const parsed = new URL(params.url.trim());
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    throw new Error('Solo se permiten enlaces HTTP o HTTPS.');
+  }
+  if (PRIVATE_IP_OR_HOST_REGEX.test(parsed.hostname)) {
+    throw new Error('Enlace bloqueado por política de seguridad (host local/privado).');
+  }
+
+  const confined = resolveConfinedScratchPath(params.targetRelativePath);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15 * 60_000);
+  const started = Date.now();
+  let bytesWritten = 0;
+
+  try {
+    const res = await fetch(parsed.toString(), {
+      redirect: 'follow',
+      signal: controller.signal,
+      headers: { 'User-Agent': 'PictaBot/2.0' },
+    });
+    if (!res.ok || !res.body) {
+      throw new Error(`El servidor remoto respondió HTTP ${res.status}.`);
+    }
+    const finalParsed = new URL(res.url || parsed.toString());
+    if (PRIVATE_IP_OR_HOST_REGEX.test(finalParsed.hostname)) {
+      throw new Error('Redirección bloqueada por seguridad.');
+    }
+
+    const contentLength = Number(res.headers.get('content-length') || 0);
+    if (contentLength > 0 && contentLength > params.maxBytes) {
+      throw new Error(`El archivo remoto (${(contentLength / 1024 ** 3).toFixed(2)} GB) supera el límite permitido.`);
+    }
+
+    const cd = res.headers.get('content-disposition') || '';
+    const cdMatch = cd.match(/filename\*?=(?:UTF-8'')?"?([^";\r\n]+)"?/i);
+    const urlBase = decodeURIComponent(finalParsed.pathname.split('/').pop() || '').trim();
+    const detectedFileName = (cdMatch?.[1] || urlBase || 'video_url.mp4').replace(/[^a-zA-Z0-9._\-\s]/g, '_');
+
+    const out = fs.createWriteStream(confined);
+    const reader = res.body.getReader();
+    let lastReport = 0;
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value || value.byteLength === 0) continue;
+        bytesWritten += value.byteLength;
+        if (bytesWritten > params.maxBytes) {
+          throw new Error('El archivo descargado superó el límite permitido.');
+        }
+        if (!out.write(Buffer.from(value))) {
+          await new Promise<void>((resolve) => out.once('drain', resolve));
+        }
+        const now = Date.now();
+        if (params.onProgress && (now - lastReport >= 900 || (contentLength > 0 && bytesWritten >= contentLength))) {
+          lastReport = now;
+          const elapsed = Math.max(0.1, (now - started) / 1000);
+          params.onProgress(
+            bytesWritten,
+            contentLength || bytesWritten,
+            Number(((bytesWritten / 1024 ** 2) / elapsed).toFixed(2))
+          );
+        }
+      }
+      await new Promise<void>((resolve, reject) => {
+        out.end(() => resolve());
+        out.on('error', reject);
+      });
+    } catch (err) {
+      out.destroy();
+      try {
+        if (fs.existsSync(confined)) fs.rmSync(confined, { force: true });
+      } catch {
+        // Ignore
+      }
+      throw err;
+    }
+
+    if (bytesWritten < 1024) {
+      throw new Error('El enlace no devolvió un archivo de video válido.');
+    }
+
+    const elapsedSec = Math.max(0.1, (Date.now() - started) / 1000);
+    return {
+      filePath: confined,
+      bytesWritten,
+      throughputMbps: Number(((bytesWritten / 1024 ** 2) / elapsedSec).toFixed(2)),
+      detectedFileName,
+    };
   } finally {
     clearTimeout(timer);
   }
@@ -191,23 +365,30 @@ export async function tgDownloadSmallFileToScratch(fileId: string, targetRelativ
 export async function tgRegisterDefaultCommands(): Promise<void> {
   await callTelegramApi('setMyCommands', {
     commands: [
-      { command: 'menu', description: 'Abrir centro de control PictaBot' },
+      { command: 'menu', description: 'Centro de control completo PictaBot' },
       { command: 'modo', description: 'Alternar modo Asistente / Rápido' },
-      { command: 'catalogo', description: 'Explorar y editar publicaciones' },
-      { command: 'series', description: 'Gestionar series y favoritas' },
+      { command: 'catalogo', description: 'Explorar, filtrar y editar videos' },
+      { command: 'top', description: 'Ranking de videos más vistos y likes' },
+      { command: 'canal', description: 'Perfil y edición de tu canal Picta' },
+      { command: 'series', description: 'Gestionar series, capítulos y portadas' },
       { command: 'listas', description: 'Gestionar listas de reproducción' },
       { command: 'comentarios', description: 'Comentarios y respuestas con IA' },
-      { command: 'peticiones', description: 'Peticiones detectadas de usuarios' },
+      { command: 'peticiones', description: 'Peticiones detectadas de audiencia' },
+      { command: 'denuncias', description: 'Resumen y lista de denuncias' },
       { command: 'promos', description: 'Canales promocionales y difusión' },
-      { command: 'cola', description: 'Ver cola y estado de subidas' },
-      { command: 'unir', description: 'Ensamblar video multiparte o ZIP/TAR' },
+      { command: 'url', description: 'Subir video desde enlace directo HTTP/S' },
+      { command: 'unir', description: 'Ensamblar multiparte, ZIP o TAR' },
       { command: 'unir_fin', description: 'Finalizar y subir ensamblaje /unir' },
-      { command: 'buscar', description: 'Buscar película/serie en TMDB' },
-      { command: 'login', description: 'Vincular tu cuenta propia de Picta' },
+      { command: 'cola', description: 'Ver cola, progreso y reintentos' },
+      { command: 'buscar', description: 'Buscar película o serie en TMDB' },
+      { command: 'ia', description: 'Asistente Gemini IA para textos/sinopsis' },
+      { command: 'stats', description: 'Estadísticas del canal (Hoy/7d/30d)' },
+      { command: 'alertas', description: 'Centro de alertas e hitos de vistas' },
+      { command: 'login', description: 'Vincular tu cuenta personal de Picta' },
       { command: 'mis_canales', description: 'Cambiar tu canal activo de Picta' },
-      { command: 'stats', description: 'Estadísticas de hoy en Picta' },
-      { command: 'estado', description: 'Salud del bot, disco y MTProto' },
-      { command: 'backup', description: 'Respaldar estado cifrado en Bóveda' },
+      { command: 'cuota', description: 'Ver tu consumo y cuota diaria' },
+      { command: 'admin', description: 'Sistema, usuarios, ajustes y bóveda' },
+      { command: 'help', description: 'Guía completa de comandos y funciones' },
     ],
   });
 }

@@ -12,7 +12,7 @@ export type TransferJobStatus =
   | 'failed'
   | 'cancelled';
 
-export type TransferJobSource = 'telegram_mtproto' | 'unir_assembler';
+export type TransferJobSource = 'telegram_mtproto' | 'unir_assembler' | 'direct_url';
 
 export interface TransferJob {
   id: string;
@@ -22,6 +22,7 @@ export interface TransferJob {
   description?: string;
   fileName: string;
   source: TransferJobSource;
+  sourceUrl?: string;
   sizeBytes: number;
   downloadedBytes: number;
   uploadedBytes: number;
@@ -38,17 +39,21 @@ export interface TransferJob {
   tipologia?: number;
   clasificacion?: string;
   keywords?: string;
+  year?: string;
   publicado?: boolean;
   descargable?: boolean;
+  mostrarComentarios?: boolean;
   autoPromo?: boolean;
   serieId?: number;
   temporada?: string;
   numero?: string;
+  playlistId?: number;
   coverUrl?: string;
   posterUrl?: string;
   customCoverPath?: string;
   telegramChatId?: string;
   telegramMessageId?: number;
+  telegramFileId?: string;
   statusMessageId?: number;
   scratchPath?: string;
   partCount?: number;
@@ -218,6 +223,15 @@ export interface PictaDenunciasSummary {
   cantidad_no_proceden: number;
   cantidad_procesadas: number;
   total: number;
+}
+
+export interface PictaDenunciaItem {
+  id: number;
+  estado: string;
+  motivo: string;
+  publicacionId?: number;
+  publicacionNombre: string;
+  fecha?: string;
 }
 
 export interface ChannelRequestRecord {

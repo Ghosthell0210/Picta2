@@ -151,7 +151,8 @@ export class MtprotoPoolManager {
     });
 
     const started = Date.now();
-    let chunkSize = 1024 * 1024; // 1 MB preferred chunk size
+    // 512 KB is Telegram's universal max for upload.GetFile across all DCs (avoids LIMIT_INVALID offset gaps)
+    const chunkSize = 512 * 1024;
     let nextOffset = 0;
     let downloadedBytes = 0;
     let lastReportAt = 0;
@@ -197,11 +198,9 @@ export class MtprotoPoolManager {
               retries += 1;
               const msg = err instanceof Error ? err.message : String(err);
 
-              if (msg.includes('LIMIT_INVALID') && chunkSize > 512 * 1024) {
-                chunkSize = 512 * 1024;
-                nextOffset = Math.min(nextOffset, offset + chunkSize);
-                netlog.warn('mtproto', 'LIMIT_INVALID recibido; ajustando tamano de bloque a 512 KB.');
-                continue;
+              if (msg.includes('LIMIT_INVALID')) {
+                fatalError = err instanceof Error ? err : new Error(msg);
+                break;
               }
 
               const floodSec = extractFloodWaitSeconds(msg);
@@ -263,7 +262,8 @@ export class MtprotoPoolManager {
     }
 
     const fullPath = resolveConfinedScratchPath(params.targetRelativePath);
-    const messages = await this.primaryClient.getMessages(params.chatId, { ids: [params.messageId] });
+    const peerTarget = /^-?\d+$/.test(String(params.chatId)) ? Number(params.chatId) : params.chatId;
+    const messages = await this.primaryClient.getMessages(peerTarget, { ids: [params.messageId] });
     const message = messages?.[0];
     if (!message || !message.media) {
       throw new Error(`Mensaje #${params.messageId} no contiene archivo descargable.`);

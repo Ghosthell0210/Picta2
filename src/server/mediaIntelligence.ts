@@ -550,6 +550,40 @@ export async function generateAiCommentReply(params: {
   }
 }
 
+export async function askGeminiAssistant(userPrompt: string, channelName?: string): Promise<string | null> {
+  const ai = getGeminiClient();
+  if (!ai) return null;
+
+  try {
+    const response = await ai.models.generateContent({
+      model: resolveGeminiModel(),
+      contents: [
+        channelName ? `Canal de Picta del creador: ${channelName}` : '',
+        `Solicitud del administrador: ${userPrompt.slice(0, 1200)}`,
+      ]
+        .filter(Boolean)
+        .join('\n'),
+      config: {
+        systemInstruction:
+          'Eres el asistente editorial de un creador de contenido en Picta (plataforma audiovisual cubana). Responde en español claro, directo y listo para copiar en Telegram o Picta (sin markdown complejo, máximo 1200 caracteres).',
+      },
+    });
+
+    const text = (response.text || '').trim().slice(0, 1800);
+    if (!text) {
+      lastGeminiErrorMessage = 'Gemini devolvió una respuesta vacía.';
+      return null;
+    }
+    lastGeminiErrorMessage = '';
+    return text;
+  } catch (err) {
+    lastGeminiErrorMessage = formatGeminiError(err);
+    console.warn(`[PictaBot][Gemini] Error asistente /ia: ${lastGeminiErrorMessage}`);
+    netlog.warn('picta', `Error asistente IA: ${lastGeminiErrorMessage}`);
+    return null;
+  }
+}
+
 export function detectViewerRequestComment(text: string): { isRequest: boolean; extractedTitle: string } {
   const clean = String(text || '').trim();
   if (clean.length < 8) return { isRequest: false, extractedTitle: '' };

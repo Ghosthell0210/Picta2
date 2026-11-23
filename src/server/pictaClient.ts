@@ -9,6 +9,7 @@ import type {
   PictaCatalogItem,
   PictaChannelProfile,
   PictaCommentItem,
+  PictaDenunciaItem,
   PictaDenunciasSummary,
   PictaPlaylistItem,
   PictaSerieItem,
@@ -559,11 +560,14 @@ export class PictaService {
     clasificacion?: string;
     channelId?: string;
     keywords?: string;
+    year?: string;
     publicado?: boolean;
     descargable?: boolean;
+    mostrarComentarios?: boolean;
     serieId?: number;
     temporada?: string;
     numero?: string;
+    playlistId?: number;
     coverUrl?: string;
     posterUrl?: string;
     customCoverPath?: string;
@@ -616,10 +620,27 @@ export class PictaService {
 
     const channelId = (params.channelId || params.ctx?.channelId || this.getDefaultChannelId()).trim();
     const tipologia = String(params.tipologia || 8);
-    const description = (params.description || `${params.title} — publicado vía PictaBot`).trim();
+    const rawKeywords = (params.keywords || '').trim();
+    // Picta's palabraClave field requires a numeric PK ID; keep textual tags inside description so API never 400s
+    const palabraClavePk = /^\d+$/.test(rawKeywords)
+      ? rawKeywords
+      : (process.env.PICTA_PALABRA_CLAVE_ID || '5476').trim();
+    const baseDesc = (params.description || `${params.title} — publicado vía PictaBot`).trim();
+    const tagLine =
+      rawKeywords && !/^\d+$/.test(rawKeywords)
+        ? `\n\nEtiquetas: ${rawKeywords
+            .split(/[,;]+/)
+            .map((t) => t.trim())
+            .filter(Boolean)
+            .slice(0, 8)
+            .join(', ')}`
+        : '';
+    const description = `${baseDesc}${tagLine}`.slice(0, 2000);
     const clasificacion = (params.clasificacion || process.env.PICTA_CLASIFICACION || '+16').trim();
     const publicado = params.publicado !== false;
     const descargable = params.descargable !== false;
+    const mostrarComentarios = params.mostrarComentarios !== false;
+    const movieYear = /^\d{4}$/.test(String(params.year || '')) ? String(params.year) : String(new Date().getFullYear());
 
     // 1. Non-fatal pre-validation
     try {
@@ -649,16 +670,16 @@ export class PictaService {
     pubForm.append('url_manifiesto', ticket.key);
     pubForm.append('publicado', String(publicado));
     pubForm.append('descargable', String(descargable));
-    pubForm.append('mostrar_comentarios', 'true');
+    pubForm.append('mostrar_comentarios', String(mostrarComentarios));
     pubForm.append('mostrar_chat', 'false');
     pubForm.append('internacional', 'false');
     pubForm.append('es_exclusivo', 'false');
     pubForm.append('clasificacion', clasificacion);
-    pubForm.append('palabraClave', (params.keywords || process.env.PICTA_PALABRA_CLAVE_ID || '5476').trim());
+    pubForm.append('palabraClave', palabraClavePk);
     pubForm.append('url_imagen', new Blob([new Uint8Array(coverBuf)], { type: 'image/jpeg' }), `portada_${Date.now()}.jpg`);
 
     if (tipologia === '1') {
-      pubForm.append('ano', String(new Date().getFullYear()));
+      pubForm.append('ano', movieYear);
       pubForm.append('pais', 'Internacional');
       pubForm.append('genero', '5');
       pubForm.append('productora', '679');
@@ -702,6 +723,33 @@ export class PictaService {
     } else {
       const errTxt = (await createRes.text()).slice(0, 260);
       throw new Error(`Error creando publicación en Picta (HTTP ${createRes.status}): ${errTxt}`);
+    }
+
+    // 2b. Optional playlist attachment + automatic alert watching
+    if (publicationId) {
+      if (params.playlistId && params.ctx) {
+        try {
+          await this.addVideoToPlaylist(params.ctx, params.playlistId, Number(publicationId));
+        } catch {
+          // Non-fatal
+        }
+      }
+      const ownerId = params.ctx?.telegramUserId || stateStore.getPrimaryAdminChatId();
+      if (ownerId && !stateStore.watchedVideos.some((w) => w.videoId === publicationId)) {
+        stateStore.watchedVideos.unshift({
+          videoId: publicationId,
+          title: params.title,
+          channelName: params.ctx?.channelName || this.getDefaultChannelName(),
+          ownerUserId: ownerId,
+          lastCommentCount: 0,
+          lastViewsCount: 0,
+          lastMilestoneNotified: 0,
+          nomadStatus: 'encoding',
+          updatedAt: new Date().toISOString(),
+        });
+        if (stateStore.watchedVideos.length > 60) stateStore.watchedVideos.length = 60;
+        stateStore.saveWatchedVideos();
+      }
     }
 
     // 3. Trigger Nomad encoder
@@ -754,6 +802,50 @@ export class PictaService {
     }
   }
 
+  public async patchChannel(
+    ctx: PictaAuthContext,
+    fields: {
+      nombre?: string;
+      descripcion?: string;
+      clasificacion?: string;
+      avatarBuffer?: Buffer;
+      bannerBuffer?: Buffer;
+    }
+  ): Promise<PictaChannelProfile | null> {
+    const apiUrl = getValidatedPictaApiUrl();
+    let lastErr = '';
+    for (const ver of ['v1', 'v2']) {
+      const form = new FormData();
+      if (fields.nombre !== undefined) form.append('nombre', fields.nombre);
+      if (fields.descripcion !== undefined) form.append('descripcion', fields.descripcion);
+      if (fields.clasificacion !== undefined) form.append('clasificacion', fields.clasificacion);
+      if (fields.avatarBuffer) {
+        form.append(
+          'url_avatar',
+          new Blob([new Uint8Array(fields.avatarBuffer)], { type: 'image/jpeg' }),
+          `avatar_${Date.now()}.jpg`
+        );
+      }
+      if (fields.bannerBuffer) {
+        form.append(
+          'url_imagen',
+          new Blob([new Uint8Array(fields.bannerBuffer)], { type: 'image/jpeg' }),
+          `banner_${Date.now()}.jpg`
+        );
+      }
+      const res = await fetchWithTimeout(
+        `${apiUrl}/${ver}/canal/${encodeURIComponent(ctx.channelId)}/`,
+        { method: 'PATCH', headers: this.getAdminHeaders(ctx.accessToken), body: form },
+        15_000
+      );
+      if (res.ok) {
+        return this.fetchChannelDetails(ctx, ctx.channelId);
+      }
+      lastErr = `HTTP ${res.status}: ${(await res.text()).slice(0, 180)}`;
+    }
+    throw new Error(`Picta rechazó la edición del canal (${lastErr}).`);
+  }
+
   private mapPublicationRow(r: Record<string, unknown>): PictaCatalogItem {
     const id = String(r.id ?? '');
     const slug = typeof r.slug === 'string' ? r.slug : undefined;
@@ -794,6 +886,8 @@ export class PictaService {
     page?: number;
     pageSize?: number;
     search?: string;
+    ordering?: string;
+    visibility?: 'all' | 'published' | 'hidden';
   }): Promise<{ items: PictaCatalogItem[]; total: number; hasNext: boolean }> {
     const apiUrl = getValidatedPictaApiUrl();
     const targetChannel = (params.channelId || params.ctx?.channelId || this.getDefaultChannelId()).trim();
@@ -801,33 +895,41 @@ export class PictaService {
     const pageSize = Math.min(50, Math.max(1, params.pageSize || 10));
     const token = params.ctx?.accessToken || (await this.tryMasterToken());
 
-    const url = new URL(`${apiUrl}/v2/publicacion/`);
-    url.searchParams.set('canal_id', targetChannel);
-    url.searchParams.set('page', String(page));
-    url.searchParams.set('page_size', String(pageSize));
-    if (params.search?.trim()) url.searchParams.set('search', params.search.trim());
+    for (const channelParam of ['canal_id', 'canal']) {
+      const url = new URL(`${apiUrl}/v2/publicacion/`);
+      url.searchParams.set(channelParam, targetChannel);
+      url.searchParams.set('page', String(page));
+      url.searchParams.set('page_size', String(pageSize));
+      if (params.search?.trim()) url.searchParams.set('search', params.search.trim());
+      if (params.ordering?.trim()) url.searchParams.set('ordering', params.ordering.trim());
+      if (params.visibility === 'published') url.searchParams.set('publicado', 'true');
+      if (params.visibility === 'hidden') url.searchParams.set('publicado', 'false');
 
-    try {
-      const res = await fetchWithTimeout(
-        url.toString(),
-        { method: 'GET', headers: this.getAdminHeaders(token) },
-        10_000
-      );
-      if (!res.ok) return { items: [], total: 0, hasNext: false };
-      const data = (await res.json()) as {
-        count?: number;
-        next?: string | null;
-        results?: Array<Record<string, unknown>>;
-      };
-      const rows = Array.isArray(data.results) ? data.results : [];
-      return {
-        items: rows.map((r) => this.mapPublicationRow(r)),
-        total: Number(data.count ?? rows.length),
-        hasNext: Boolean(data.next),
-      };
-    } catch {
-      return { items: [], total: 0, hasNext: false };
+      try {
+        const res = await fetchWithTimeout(
+          url.toString(),
+          { method: 'GET', headers: this.getAdminHeaders(token) },
+          10_000
+        );
+        if (!res.ok) continue;
+        const data = (await res.json()) as {
+          count?: number;
+          next?: string | null;
+          results?: Array<Record<string, unknown>>;
+        };
+        const rows = Array.isArray(data.results) ? data.results : [];
+        if (rows.length > 0 || channelParam === 'canal') {
+          return {
+            items: rows.map((r) => this.mapPublicationRow(r)),
+            total: Number(data.count ?? rows.length),
+            hasNext: Boolean(data.next),
+          };
+        }
+      } catch {
+        // Try fallback parameter name
+      }
     }
+    return { items: [], total: 0, hasNext: false };
   }
 
   public async fetchPublicationById(videoId: string, ctx?: PictaAuthContext): Promise<PictaCatalogItem | null> {
@@ -854,32 +956,42 @@ export class PictaService {
       descripcion?: string;
       publicado?: boolean;
       descargable?: boolean;
+      mostrar_comentarios?: boolean;
       clasificacion?: string;
       tipologia?: number;
+      serie?: number;
+      temporada?: string;
+      numero?: string;
       coverBuffer?: Buffer;
       posterBuffer?: Buffer;
     }
   ): Promise<PictaCatalogItem | null> {
     const apiUrl = getValidatedPictaApiUrl();
-    const form = new FormData();
-    if (fields.nombre !== undefined) form.append('nombre', fields.nombre);
-    if (fields.descripcion !== undefined) form.append('descripcion', fields.descripcion);
-    if (fields.publicado !== undefined) form.append('publicado', String(fields.publicado));
-    if (fields.descargable !== undefined) form.append('descargable', String(fields.descargable));
-    if (fields.clasificacion !== undefined) form.append('clasificacion', fields.clasificacion);
-    if (fields.tipologia !== undefined) form.append('tipologia', String(fields.tipologia));
-    if (fields.coverBuffer) {
-      form.append('url_imagen', new Blob([new Uint8Array(fields.coverBuffer)], { type: 'image/jpeg' }), `cover_${Date.now()}.jpg`);
-    }
-    if (fields.posterBuffer) {
-      form.append(
-        'imagen_secundaria',
-        new Blob([new Uint8Array(fields.posterBuffer)], { type: 'image/jpeg' }),
-        `poster_${Date.now()}.jpg`
-      );
-    }
+    let lastErr = '';
 
     for (const ver of ['v1', 'v2']) {
+      const form = new FormData();
+      if (fields.nombre !== undefined) form.append('nombre', fields.nombre);
+      if (fields.descripcion !== undefined) form.append('descripcion', fields.descripcion);
+      if (fields.publicado !== undefined) form.append('publicado', String(fields.publicado));
+      if (fields.descargable !== undefined) form.append('descargable', String(fields.descargable));
+      if (fields.mostrar_comentarios !== undefined) form.append('mostrar_comentarios', String(fields.mostrar_comentarios));
+      if (fields.clasificacion !== undefined) form.append('clasificacion', fields.clasificacion);
+      if (fields.tipologia !== undefined) form.append('tipologia', String(fields.tipologia));
+      if (fields.serie !== undefined) form.append('serie', String(fields.serie));
+      if (fields.temporada !== undefined) form.append('temporada', String(fields.temporada));
+      if (fields.numero !== undefined) form.append('numero', String(fields.numero));
+      if (fields.coverBuffer) {
+        form.append('url_imagen', new Blob([new Uint8Array(fields.coverBuffer)], { type: 'image/jpeg' }), `cover_${Date.now()}.jpg`);
+      }
+      if (fields.posterBuffer) {
+        form.append(
+          'imagen_secundaria',
+          new Blob([new Uint8Array(fields.posterBuffer)], { type: 'image/jpeg' }),
+          `poster_${Date.now()}.jpg`
+        );
+      }
+
       const res = await fetchWithTimeout(
         `${apiUrl}/${ver}/publicacion/${encodeURIComponent(videoId)}/`,
         { method: 'PATCH', headers: this.getAdminHeaders(ctx.accessToken), body: form },
@@ -889,8 +1001,9 @@ export class PictaService {
         const json = (await res.json()) as Record<string, unknown>;
         return this.mapPublicationRow(json);
       }
+      lastErr = `HTTP ${res.status}: ${(await res.text()).slice(0, 180)}`;
     }
-    throw new Error(`Picta rechazó la edición de la publicación #${videoId}.`);
+    throw new Error(`Picta rechazó la edición de #${videoId} (${lastErr}).`);
   }
 
   public async deletePublication(ctx: PictaAuthContext, videoId: string): Promise<boolean> {
@@ -913,34 +1026,61 @@ export class PictaService {
     const apiUrl = getValidatedPictaApiUrl();
     const targetChannel = (channelId || ctx.channelId).trim();
     const pinnedSet = new Set(stateStore.pinnedSeriesIds);
-    try {
-      const res = await fetchWithTimeout(
-        `${apiUrl}/v2/serie/?canal_id=${encodeURIComponent(targetChannel)}&page_size=50`,
-        { method: 'GET', headers: this.getAdminHeaders(ctx.accessToken) },
-        10_000
-      );
-      if (!res.ok) return [];
-      const data = (await res.json()) as { results?: Array<Record<string, unknown>> };
-      const rows = Array.isArray(data.results) ? data.results : [];
-      return rows
-        .map((r) => {
-          const id = Number(r.id || 0);
-          return {
-            id,
-            nombre: String(r.nombre || `Serie #${id}`),
-            descripcion: String(r.descripcion || ''),
-            canalId: Number(r.canal || targetChannel),
-            cantidad_capitulos: Number(r.cantidad_capitulos ?? r.cantidad_publicaciones ?? 0),
-            url_imagen: typeof r.url_imagen === 'string' ? r.url_imagen : undefined,
-            imagen_secundaria: typeof r.imagen_secundaria === 'string' ? r.imagen_secundaria : undefined,
-            publicado: r.publicado !== false,
-            pinned: pinnedSet.has(id),
-          };
-        })
-        .sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)));
-    } catch {
-      return [];
+    for (const paramName of ['canal_id', 'canal']) {
+      try {
+        const res = await fetchWithTimeout(
+          `${apiUrl}/v2/serie/?${paramName}=${encodeURIComponent(targetChannel)}&page_size=50`,
+          { method: 'GET', headers: this.getAdminHeaders(ctx.accessToken) },
+          10_000
+        );
+        if (!res.ok) continue;
+        const data = (await res.json()) as { results?: Array<Record<string, unknown>> };
+        const rows = Array.isArray(data.results) ? data.results : [];
+        if (rows.length > 0 || paramName === 'canal') {
+          return rows
+            .map((r) => {
+              const id = Number(r.id || 0);
+              return {
+                id,
+                nombre: String(r.nombre || `Serie #${id}`),
+                descripcion: String(r.descripcion || ''),
+                canalId: Number(r.canal || targetChannel),
+                cantidad_capitulos: Number(r.cantidad_capitulos ?? r.cantidad_publicaciones ?? 0),
+                url_imagen: typeof r.url_imagen === 'string' ? r.url_imagen : undefined,
+                imagen_secundaria: typeof r.imagen_secundaria === 'string' ? r.imagen_secundaria : undefined,
+                publicado: r.publicado !== false,
+                pinned: pinnedSet.has(id),
+              };
+            })
+            .sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)));
+        }
+      } catch {
+        // Fallback param
+      }
     }
+    return [];
+  }
+
+  public async fetchSeriesEpisodes(ctx: PictaAuthContext, serieId: number): Promise<PictaCatalogItem[]> {
+    const apiUrl = getValidatedPictaApiUrl();
+    for (const paramName of ['serie_id', 'serie']) {
+      try {
+        const res = await fetchWithTimeout(
+          `${apiUrl}/v2/publicacion/?${paramName}=${encodeURIComponent(String(serieId))}&page_size=40`,
+          { method: 'GET', headers: this.getAdminHeaders(ctx.accessToken) },
+          10_000
+        );
+        if (!res.ok) continue;
+        const data = (await res.json()) as { results?: Array<Record<string, unknown>> };
+        const rows = Array.isArray(data.results) ? data.results : [];
+        if (rows.length > 0 || paramName === 'serie') {
+          return rows.map((r) => this.mapPublicationRow(r));
+        }
+      } catch {
+        // Fallback
+      }
+    }
+    return [];
   }
 
   public async createSerie(
@@ -977,31 +1117,77 @@ export class PictaService {
     };
   }
 
+  public async patchSerie(
+    ctx: PictaAuthContext,
+    serieId: number,
+    fields: { nombre?: string; descripcion?: string; publicado?: boolean; coverBuffer?: Buffer }
+  ): Promise<boolean> {
+    const apiUrl = getValidatedPictaApiUrl();
+    let lastErr = '';
+    for (const ver of ['v1', 'v2']) {
+      const form = new FormData();
+      if (fields.nombre !== undefined) form.append('nombre', fields.nombre.trim());
+      if (fields.descripcion !== undefined) form.append('descripcion', fields.descripcion.trim());
+      if (fields.publicado !== undefined) form.append('publicado', String(fields.publicado));
+      if (fields.coverBuffer) {
+        form.append('url_imagen', new Blob([new Uint8Array(fields.coverBuffer)], { type: 'image/jpeg' }), `serie_${Date.now()}.jpg`);
+      }
+      const res = await fetchWithTimeout(
+        `${apiUrl}/${ver}/serie/${encodeURIComponent(String(serieId))}/`,
+        { method: 'PATCH', headers: this.getAdminHeaders(ctx.accessToken), body: form },
+        15_000
+      );
+      if (res.ok) return true;
+      lastErr = `HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`;
+    }
+    throw new Error(`No se pudo actualizar la serie #${serieId} (${lastErr}).`);
+  }
+
+  public async deleteSerie(ctx: PictaAuthContext, serieId: number): Promise<boolean> {
+    const apiUrl = getValidatedPictaApiUrl();
+    for (const ver of ['v1', 'v2']) {
+      const res = await fetchWithTimeout(
+        `${apiUrl}/${ver}/serie/${encodeURIComponent(String(serieId))}/`,
+        { method: 'DELETE', headers: this.getAdminHeaders(ctx.accessToken) },
+        12_000
+      );
+      if (res.ok || res.status === 204) return true;
+    }
+    return false;
+  }
+
   public async fetchChannelPlaylists(ctx: PictaAuthContext, channelId?: string): Promise<PictaPlaylistItem[]> {
     const apiUrl = getValidatedPictaApiUrl();
     const targetChannel = (channelId || ctx.channelId).trim();
-    try {
-      const res = await fetchWithTimeout(
-        `${apiUrl}/v2/lista_reproduccion/?canal_id=${encodeURIComponent(targetChannel)}&page_size=50`,
-        { method: 'GET', headers: this.getAdminHeaders(ctx.accessToken) },
-        10_000
-      );
-      if (!res.ok) return [];
-      const data = (await res.json()) as { results?: Array<Record<string, unknown>> };
-      const rows = Array.isArray(data.results) ? data.results : [];
-      return rows.map((r) => ({
-        id: Number(r.id || 0),
-        nombre: String(r.nombre || 'Lista sin nombre'),
-        publicado: r.publicado !== false,
-        descarga: Boolean(r.descarga),
-        fecha_creacion: typeof r.fecha_creacion === 'string' ? r.fecha_creacion : undefined,
-        canalId: Number(targetChannel),
-        canalNombre: ctx.channelName,
-        publicacionesIds: Array.isArray(r.publicaciones) ? r.publicaciones.map((x) => Number(x)) : [],
-      }));
-    } catch {
-      return [];
+    for (const paramName of ['canal_id', 'canal']) {
+      try {
+        const res = await fetchWithTimeout(
+          `${apiUrl}/v2/lista_reproduccion/?${paramName}=${encodeURIComponent(targetChannel)}&page_size=50`,
+          { method: 'GET', headers: this.getAdminHeaders(ctx.accessToken) },
+          10_000
+        );
+        if (!res.ok) continue;
+        const data = (await res.json()) as { results?: Array<Record<string, unknown>> };
+        const rows = Array.isArray(data.results) ? data.results : [];
+        if (rows.length > 0 || paramName === 'canal') {
+          return rows.map((r) => ({
+            id: Number(r.id || 0),
+            nombre: String(r.nombre || 'Lista sin nombre'),
+            publicado: r.publicado !== false,
+            descarga: Boolean(r.descarga),
+            fecha_creacion: typeof r.fecha_creacion === 'string' ? r.fecha_creacion : undefined,
+            canalId: Number(targetChannel),
+            canalNombre: ctx.channelName,
+            publicacionesIds: Array.isArray(r.publicaciones)
+              ? r.publicaciones.map((x) => (typeof x === 'object' && x !== null ? Number((x as { id?: unknown }).id || 0) : Number(x))).filter((n) => n > 0)
+              : [],
+          }));
+        }
+      } catch {
+        // Fallback param
+      }
     }
+    return [];
   }
 
   public async createPlaylist(ctx: PictaAuthContext, nombre: string): Promise<PictaPlaylistItem> {
@@ -1033,66 +1219,180 @@ export class PictaService {
     };
   }
 
-  public async fetchChannelComments(ctx: PictaAuthContext, limit = 25): Promise<PictaCommentItem[]> {
+  public async patchPlaylist(
+    ctx: PictaAuthContext,
+    playlistId: number,
+    fields: { nombre?: string; publicado?: boolean; descarga?: boolean; publicaciones?: number[] }
+  ): Promise<boolean> {
     const apiUrl = getValidatedPictaApiUrl();
-    const ignoredSet = new Set(stateStore.ignoredCommentIds);
-    try {
+    let lastErr = '';
+    for (const ver of ['v1', 'v2']) {
       const res = await fetchWithTimeout(
-        `${apiUrl}/v2/comentario/?canal_id=${encodeURIComponent(ctx.channelId)}&page_size=${Math.min(50, limit)}&ordering=-fecha`,
-        { method: 'GET', headers: this.getAdminHeaders(ctx.accessToken) },
+        `${apiUrl}/${ver}/lista_reproduccion/${encodeURIComponent(String(playlistId))}/`,
+        {
+          method: 'PATCH',
+          headers: { ...this.getAdminHeaders(ctx.accessToken), 'Content-Type': 'application/json' },
+          body: JSON.stringify(fields),
+        },
         12_000
       );
-      if (!res.ok) return [];
-      const data = (await res.json()) as { results?: Array<Record<string, unknown>> };
-      const rows = Array.isArray(data.results) ? data.results : [];
-      let newRequestsAdded = false;
+      if (res.ok) return true;
+      lastErr = `HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`;
+    }
+    throw new Error(`No se pudo editar la lista #${playlistId} (${lastErr}).`);
+  }
 
-      const mapped: PictaCommentItem[] = rows.map((r) => {
-        const id = Number(r.id || 0);
-        const texto = String(r.texto || r.comentario || '').trim();
-        const userObj = r.usuario && typeof r.usuario === 'object' ? (r.usuario as Record<string, unknown>) : null;
-        const pubObj = r.publicacion && typeof r.publicacion === 'object' ? (r.publicacion as Record<string, unknown>) : null;
-        const usuario =
-          (userObj && String(userObj.username || userObj.first_name || 'Usuario')) ||
-          String(r.usuario_nombre || 'Usuario');
-        const publicacionId = pubObj ? Number(pubObj.id || 0) : Number(r.publicacion || 0);
-        const publicacionNombre = (pubObj && String(pubObj.nombre || 'Video')) || String(r.publicacion_nombre || 'Video');
-        const replyCount = Number(r.cantidad_respuestas ?? (Array.isArray(r.respuestas) ? r.respuestas.length : 0));
-        const reqCheck = detectViewerRequestComment(texto);
+  public async addVideoToPlaylist(ctx: PictaAuthContext, playlistId: number, videoId: number): Promise<boolean> {
+    const lists = await this.fetchChannelPlaylists(ctx);
+    const target = lists.find((l) => l.id === playlistId);
+    const current = target ? [...target.publicacionesIds] : [];
+    if (!current.includes(videoId)) current.push(videoId);
+    return this.patchPlaylist(ctx, playlistId, { publicaciones: current });
+  }
 
-        if (reqCheck.isRequest && id > 0 && !stateStore.channelRequests.some((cr) => cr.commentId === id)) {
-          stateStore.channelRequests.unshift({
-            id: crypto.randomUUID(),
-            commentId: id,
-            requesterName: usuario,
-            requestedTitle: reqCheck.extractedTitle,
-            rawText: texto.slice(0, 260),
-            sourceVideoTitle: publicacionNombre,
-            status: 'pending',
-            createdAt: String(r.fecha || new Date().toISOString()),
-          });
-          newRequestsAdded = true;
+  public async removeVideoFromPlaylist(ctx: PictaAuthContext, playlistId: number, videoId: number): Promise<boolean> {
+    const lists = await this.fetchChannelPlaylists(ctx);
+    const target = lists.find((l) => l.id === playlistId);
+    if (!target) return false;
+    const next = target.publicacionesIds.filter((id) => id !== videoId);
+    return this.patchPlaylist(ctx, playlistId, { publicaciones: next });
+  }
+
+  public async deletePlaylist(ctx: PictaAuthContext, playlistId: number): Promise<boolean> {
+    const apiUrl = getValidatedPictaApiUrl();
+    for (const ver of ['v1', 'v2']) {
+      const res = await fetchWithTimeout(
+        `${apiUrl}/${ver}/lista_reproduccion/${encodeURIComponent(String(playlistId))}/`,
+        { method: 'DELETE', headers: this.getAdminHeaders(ctx.accessToken) },
+        12_000
+      );
+      if (res.ok || res.status === 204) return true;
+    }
+    return false;
+  }
+
+  private mapCommentRows(
+    rows: Array<Record<string, unknown>>,
+    fallbackPub?: { id: number; nombre: string }
+  ): PictaCommentItem[] {
+    const ignoredSet = new Set(stateStore.ignoredCommentIds);
+    let newRequestsAdded = false;
+
+    const mapped: PictaCommentItem[] = rows.map((r) => {
+      const id = Number(r.id || 0);
+      const texto = String(r.texto || r.comentario || r.contenido || '').trim();
+      const userObj = r.usuario && typeof r.usuario === 'object' ? (r.usuario as Record<string, unknown>) : null;
+      const pubObj = r.publicacion && typeof r.publicacion === 'object' ? (r.publicacion as Record<string, unknown>) : null;
+      const usuario =
+        (userObj && String(userObj.username || userObj.first_name || 'Usuario')) ||
+        String(r.usuario_nombre || r.nombre_usuario || 'Usuario');
+      const publicacionId = (pubObj ? Number(pubObj.id || 0) : Number(r.publicacion || 0)) || fallbackPub?.id || 0;
+      const publicacionNombre =
+        (pubObj && String(pubObj.nombre || '')) ||
+        String(r.publicacion_nombre || '') ||
+        fallbackPub?.nombre ||
+        'Video';
+      const replyCount = Number(
+        r.cantidad_respuestas ??
+          (Array.isArray(r.respuestas) ? r.respuestas.length : Array.isArray(r.respuesta_set) ? r.respuesta_set.length : 0)
+      );
+      const reqCheck = detectViewerRequestComment(texto);
+
+      if (reqCheck.isRequest && id > 0 && !stateStore.channelRequests.some((cr) => cr.commentId === id)) {
+        stateStore.channelRequests.unshift({
+          id: crypto.randomUUID(),
+          commentId: id,
+          requesterName: usuario,
+          requestedTitle: reqCheck.extractedTitle,
+          rawText: texto.slice(0, 260),
+          sourceVideoTitle: publicacionNombre,
+          status: 'pending',
+          createdAt: String(r.fecha || r.fecha_creacion || new Date().toISOString()),
+        });
+        newRequestsAdded = true;
+      }
+
+      return {
+        id,
+        texto,
+        usuario,
+        usuarioId: userObj ? Number(userObj.id || 0) : undefined,
+        fecha: String(r.fecha || r.fecha_creacion || ''),
+        publicacionId,
+        publicacionNombre,
+        categoriaNombre: 'Comentario',
+        parentId: r.parent ? Number(r.parent) : undefined,
+        replyCount,
+        answered: replyCount > 0,
+        isLikelyRequest: reqCheck.isRequest,
+        ignored: ignoredSet.has(id),
+      };
+    });
+
+    if (newRequestsAdded) stateStore.saveChannelRequests();
+    return mapped.filter((c) => c.id > 0 && c.texto.length > 0);
+  }
+
+  public async fetchPublicationComments(
+    ctx: PictaAuthContext,
+    publicacionId: number,
+    publicacionNombre = 'Video',
+    limit = 20
+  ): Promise<PictaCommentItem[]> {
+    const apiUrl = getValidatedPictaApiUrl();
+    for (const paramName of ['publicacion_id', 'publicacion']) {
+      try {
+        const res = await fetchWithTimeout(
+          `${apiUrl}/v2/comentario/?${paramName}=${encodeURIComponent(String(publicacionId))}&page_size=${Math.min(50, limit)}&ordering=-fecha`,
+          { method: 'GET', headers: this.getAdminHeaders(ctx.accessToken) },
+          10_000
+        );
+        if (!res.ok) continue;
+        const data = (await res.json()) as { results?: Array<Record<string, unknown>> };
+        const rows = Array.isArray(data.results) ? data.results : [];
+        if (rows.length > 0 || paramName === 'publicacion') {
+          return this.mapCommentRows(rows, { id: publicacionId, nombre: publicacionNombre });
         }
+      } catch {
+        // Fallback
+      }
+    }
+    return [];
+  }
 
-        return {
-          id,
-          texto,
-          usuario,
-          usuarioId: userObj ? Number(userObj.id || 0) : undefined,
-          fecha: String(r.fecha || ''),
-          publicacionId,
-          publicacionNombre,
-          categoriaNombre: 'Comentario',
-          parentId: r.parent ? Number(r.parent) : undefined,
-          replyCount,
-          answered: replyCount > 0,
-          isLikelyRequest: reqCheck.isRequest,
-          ignored: ignoredSet.has(id),
-        };
-      });
+  public async fetchChannelComments(ctx: PictaAuthContext, limit = 30): Promise<PictaCommentItem[]> {
+    const apiUrl = getValidatedPictaApiUrl();
+    const directQueries = [
+      `${apiUrl}/v2/comentario/?canal_id=${encodeURIComponent(ctx.channelId)}&page_size=${Math.min(50, limit)}&ordering=-fecha`,
+      `${apiUrl}/v2/comentario/?publicacion__canal=${encodeURIComponent(ctx.channelId)}&page_size=${Math.min(50, limit)}&ordering=-fecha`,
+    ];
 
-      if (newRequestsAdded) stateStore.saveChannelRequests();
-      return mapped;
+    for (const url of directQueries) {
+      try {
+        const res = await fetchWithTimeout(url, { method: 'GET', headers: this.getAdminHeaders(ctx.accessToken) }, 10_000);
+        if (!res.ok) continue;
+        const data = (await res.json()) as { results?: Array<Record<string, unknown>> };
+        const rows = Array.isArray(data.results) ? data.results : [];
+        if (rows.length > 0) {
+          return this.mapCommentRows(rows);
+        }
+      } catch {
+        // Fallback to next query
+      }
+    }
+
+    // Tier-3 fallback: scan top recent publications that actually have comments
+    try {
+      const pubs = await this.fetchChannelPublications({ ctx, page: 1, pageSize: 20 });
+      const withComments = pubs.items.filter((p) => p.cantidad_comentarios > 0).slice(0, 8);
+      if (withComments.length === 0) return [];
+      const batches = await Promise.all(
+        withComments.map((p) => this.fetchPublicationComments(ctx, Number(p.id), p.nombre, 8))
+      );
+      return batches
+        .flat()
+        .sort((a, b) => String(b.fecha || '').localeCompare(String(a.fecha || '')))
+        .slice(0, limit);
     } catch {
       return [];
     }
@@ -1123,6 +1423,30 @@ export class PictaService {
         12_000
       );
       if (res.ok) return true;
+
+      const form = new FormData();
+      form.append('publicacion', String(params.publicacionId));
+      form.append('parent', String(params.parentCommentId));
+      form.append('texto', params.texto.trim());
+      const formRes = await fetchWithTimeout(
+        `${apiUrl}/${ver}/comentario/`,
+        { method: 'POST', headers: this.getAdminHeaders(ctx.accessToken), body: form },
+        12_000
+      );
+      if (formRes.ok) return true;
+    }
+    return false;
+  }
+
+  public async deleteComment(ctx: PictaAuthContext, commentId: number): Promise<boolean> {
+    const apiUrl = getValidatedPictaApiUrl();
+    for (const ver of ['v2', 'v1']) {
+      const res = await fetchWithTimeout(
+        `${apiUrl}/${ver}/comentario/${encodeURIComponent(String(commentId))}/`,
+        { method: 'DELETE', headers: this.getAdminHeaders(ctx.accessToken) },
+        10_000
+      );
+      if (res.ok || res.status === 204) return true;
     }
     return false;
   }
@@ -1160,22 +1484,59 @@ export class PictaService {
     }
   }
 
-  public async fetchChannelStats(ctx?: PictaAuthContext): Promise<Record<string, unknown> | null> {
+  public async fetchDenunciasList(ctx: PictaAuthContext, limit = 10): Promise<PictaDenunciaItem[]> {
+    const apiUrl = getValidatedPictaApiUrl();
+    for (const paramName of ['canal_id', 'canal']) {
+      try {
+        const res = await fetchWithTimeout(
+          `${apiUrl}/v2/denuncia/?${paramName}=${encodeURIComponent(ctx.channelId)}&page_size=${limit}`,
+          { method: 'GET', headers: this.getAdminHeaders(ctx.accessToken) },
+          10_000
+        );
+        if (!res.ok) continue;
+        const data = (await res.json()) as { results?: Array<Record<string, unknown>> };
+        const rows = Array.isArray(data.results) ? data.results : [];
+        if (rows.length > 0 || paramName === 'canal') {
+          return rows.map((r) => {
+            const pubObj = r.publicacion && typeof r.publicacion === 'object' ? (r.publicacion as Record<string, unknown>) : null;
+            return {
+              id: Number(r.id || 0),
+              estado: String(r.estado || 'pendiente'),
+              motivo: String(r.motivo || r.descripcion || r.tipo || 'Sin detalle').slice(0, 140),
+              publicacionId: pubObj ? Number(pubObj.id || 0) : Number(r.publicacion || 0) || undefined,
+              publicacionNombre: (pubObj && String(pubObj.nombre || '')) || String(r.publicacion_nombre || 'Publicación'),
+              fecha: typeof r.fecha === 'string' ? r.fecha : typeof r.fecha_creacion === 'string' ? r.fecha_creacion : undefined,
+            };
+          });
+        }
+      } catch {
+        // Fallback
+      }
+    }
+    return [];
+  }
+
+  public async fetchChannelStats(ctx?: PictaAuthContext, days = 1): Promise<Record<string, unknown> | null> {
     try {
       const token = ctx?.accessToken || (await this.authenticateMaster());
       const apiUrl = getValidatedPictaApiUrl();
-      const todayHavana = new Intl.DateTimeFormat('en-CA', {
+      const fmt = new Intl.DateTimeFormat('en-CA', {
         timeZone: 'America/Havana',
         year: 'numeric',
         month: '2-digit',
         day: '2-digit',
-      }).format(new Date());
+      });
+      const endDate = new Date();
+      const startDate = new Date(endDate.getTime() - Math.max(0, days - 1) * 86_400_000);
+      const fromStr = fmt.format(startDate);
+      const toStr = fmt.format(endDate);
 
-      const res = await fetchWithTimeout(
-        `${apiUrl}/v2/resumen/datos/?date__gte=${todayHavana}&date__lte=${todayHavana}`,
-        { method: 'GET', headers: this.getAdminHeaders(token) },
-        10_000
-      );
+      const url = new URL(`${apiUrl}/v2/resumen/datos/`);
+      url.searchParams.set('date__gte', fromStr);
+      url.searchParams.set('date__lte', toStr);
+      if (ctx?.channelId) url.searchParams.set('canal_id', ctx.channelId);
+
+      const res = await fetchWithTimeout(url.toString(), { method: 'GET', headers: this.getAdminHeaders(token) }, 10_000);
       if (!res.ok) return null;
       return (await res.json()) as Record<string, unknown>;
     } catch {
