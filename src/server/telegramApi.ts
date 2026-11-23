@@ -362,33 +362,63 @@ export async function downloadDirectUrlToScratch(params: {
   }
 }
 
+export function hudHeader(title: string, icon?: string): string {
+  const prefix = icon ? `${icon} ` : '';
+  return `<b>⟦ ${prefix}${escHtml(title)} ⟧</b>\n`;
+}
+
+export function hudSection(title: string): string {
+  return `\n<b>▸ ${escHtml(title)}</b>\n`;
+}
+
+export function hudBox(lines: Array<string | null | undefined | false>): string {
+  const valid = lines.filter((l): l is string => Boolean(l && String(l).trim()));
+  if (valid.length === 0) return '';
+  return `<blockquote>${valid.join('\n')}</blockquote>\n`;
+}
+
+export function hudSegmentedBar(valueOrPct: number, totalOrSegments = 10, explicitSegments?: number): string {
+  const pct =
+    explicitSegments !== undefined
+      ? totalOrSegments > 0
+        ? (valueOrPct / totalOrSegments) * 100
+        : 0
+      : valueOrPct;
+  const segments = explicitSegments !== undefined ? explicitSegments : totalOrSegments;
+  const clamped = Math.max(0, Math.min(100, Math.round(pct)));
+  const filled = Math.round((clamped / 100) * segments);
+  return '▰'.repeat(filled) + '▱'.repeat(Math.max(0, segments - filled));
+}
+
+export function formatMilestoneNumber(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n % 1_000_000 === 0 ? 0 : 1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(n % 1_000 === 0 ? 0 : 1)}K`;
+  return String(n);
+}
+
 export async function tgRegisterDefaultCommands(): Promise<void> {
   await callTelegramApi('setMyCommands', {
     commands: [
-      { command: 'menu', description: 'Centro de control completo PictaBot' },
-      { command: 'modo', description: 'Alternar modo Asistente / Rápido' },
-      { command: 'catalogo', description: 'Explorar, filtrar y editar videos' },
-      { command: 'top', description: 'Ranking de videos más vistos y likes' },
-      { command: 'canal', description: 'Perfil y edición de tu canal Picta' },
-      { command: 'series', description: 'Gestionar series, capítulos y portadas' },
-      { command: 'listas', description: 'Gestionar listas de reproducción' },
-      { command: 'comentarios', description: 'Comentarios y respuestas con IA' },
-      { command: 'peticiones', description: 'Peticiones detectadas de audiencia' },
-      { command: 'denuncias', description: 'Resumen y lista de denuncias' },
-      { command: 'promos', description: 'Canales promocionales y difusión' },
-      { command: 'url', description: 'Subir video desde enlace directo HTTP/S' },
-      { command: 'unir', description: 'Ensamblar multiparte, ZIP o TAR' },
-      { command: 'unir_fin', description: 'Finalizar y subir ensamblaje /unir' },
-      { command: 'cola', description: 'Ver cola, progreso y reintentos' },
-      { command: 'buscar', description: 'Buscar película o serie en TMDB' },
-      { command: 'ia', description: 'Asistente Gemini IA para textos/sinopsis' },
-      { command: 'stats', description: 'Estadísticas del canal (Hoy/7d/30d)' },
-      { command: 'alertas', description: 'Centro de alertas e hitos de vistas' },
-      { command: 'login', description: 'Vincular tu cuenta personal de Picta' },
-      { command: 'mis_canales', description: 'Cambiar tu canal activo de Picta' },
-      { command: 'cuota', description: 'Ver tu consumo y cuota diaria' },
-      { command: 'admin', description: 'Sistema, usuarios, ajustes y bóveda' },
-      { command: 'help', description: 'Guía completa de comandos y funciones' },
+      { command: 'buscar', description: '🔎 Buscar si una película, serie o video ya existe en Picta' },
+      { command: 'canal', description: '🏛️ Editar mi Canal de Picta (Nombre, Lema, Avatar, Portada)' },
+      { command: 'series', description: '📺 Series de mi Canal y 📌 Modo Serie Fija (Ráfaga)' },
+      { command: 'cola', description: '📋 Ver Cola de Espera, Modo Ráfaga y Cancelar Subidas' },
+      { command: 'cuota', description: '⚡ Dividir Cuota Diaria (10/día) y Pool Multi-Cuenta (+10/cuenta)' },
+      { command: 'stats', description: '📊 Dashboard de Picta y Edición de Videos Publicados' },
+      { command: 'auditoria', description: '🩺 Auditar duplicados internos, faltantes y salud de tu canal' },
+      { command: 'pedidos', description: '📥 Gestor de pedidos y verificador rápido en Picta' },
+      { command: 'canalpedidos', description: '📢 Configurar Canal/Grupo de Pedidos y auto-verificador' },
+      { command: 'logros', description: '🏆 Alertas de Comentarios y Metas de Reproducciones/Likes' },
+      { command: 'cuenta', description: '🛡️ Estado y permisos Jefe de canal de tu cuenta Picta' },
+      { command: 'colaboradores', description: '👥 Gestionar Colaboradores asociados a tu canal Picta' },
+      { command: 'personas', description: '🎭 Registrar y buscar Actores, Directores y Etiquetas API' },
+      { command: 'listas', description: '📂 Gestionar Listas de Reproducción del canal' },
+      { command: 'comentarios', description: '💬 Responder Comentarios por Categoría o con IA' },
+      { command: 'reintentar', description: '🔄 Reintentar última publicación pendiente con S3' },
+      { command: 'unir', description: '🧩 Unir videos multiparte o archivos en disco' },
+      { command: 'login', description: '🔑 Vincular tu cuenta personal de Picta (aislada)' },
+      { command: 'menu', description: '🟢 Menú principal y estado del bot' },
     ],
   });
 }
+

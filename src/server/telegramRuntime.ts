@@ -42,7 +42,20 @@ import {
   getDiskStatusReport,
   resolveConfinedScratchPath,
 } from './scratchDiskManager.ts';
-import { stateStore } from './stateStore.ts';
+import {
+  addSecondaryAccountToPool,
+  renderCanalPedidosView,
+  renderChannelAuditView,
+  renderCollaboratorsView,
+  renderDailyQuotaAndPoolView,
+  renderDirectDownloadBackdoorView,
+  renderGlobalPictaSearchView,
+  renderLegacyMainMenuHud,
+  renderLiveAccountDiagnosticsView,
+  renderLogrosAndAlertsHud,
+  renderPersonasAndTagsView,
+} from './legacyViews.ts';
+import { DEFAULT_MILESTONE_THRESHOLDS, stateStore } from './stateStore.ts';
 import {
   downloadDirectUrlToScratch,
   escHtml,
@@ -61,7 +74,7 @@ import {
 
 interface TelegramMessage {
   message_id: number;
-  chat: { id: number; type: string };
+  chat: { id: number; type: string; title?: string; username?: string };
   from?: { id: number; username?: string; first_name?: string };
   text?: string;
   caption?: string;
@@ -120,10 +133,12 @@ interface UploadWizardDraft {
   publicado: boolean;
   descargable: boolean;
   mostrarComentarios: boolean;
+  duplicateConfirmed?: boolean;
   autoPromo: boolean;
   serieId?: number;
   serieName?: string;
   temporada: string;
+  temporadaId?: number;
   numero: string;
   episodeSubtitle?: string;
   playlistId?: number;
@@ -131,6 +146,10 @@ interface UploadWizardDraft {
   coverUrl?: string;
   posterUrl?: string;
   customCoverPath?: string;
+  customPosterPath?: string;
+  subtitlePath?: string;
+  subtitleFileName?: string;
+  duplicateCheckApproved?: boolean;
   tmdbCandidates: TmdbEnrichedCandidate[];
   createdAt: number;
 }
@@ -138,6 +157,8 @@ interface UploadWizardDraft {
 type PendingInputState =
   | { kind: 'login_user'; chatId: number; expiresAt: number }
   | { kind: 'login_pass'; chatId: number; username: string; expiresAt: number }
+  | { kind: 'pool_user'; chatId: number; expiresAt: number }
+  | { kind: 'pool_pass'; chatId: number; username: string; expiresAt: number }
   | { kind: 'wiz_title'; draftId: string; chatId: number; expiresAt: number }
   | { kind: 'wiz_desc'; draftId: string; chatId: number; expiresAt: number }
   | { kind: 'wiz_cover'; draftId: string; chatId: number; expiresAt: number }
@@ -149,20 +170,33 @@ type PendingInputState =
   | { kind: 'cat_title'; videoId: string; chatId: number; expiresAt: number }
   | { kind: 'cat_desc'; videoId: string; chatId: number; expiresAt: number }
   | { kind: 'cat_cover'; videoId: string; chatId: number; expiresAt: number }
+  | { kind: 'cat_poster'; videoId: string; chatId: number; expiresAt: number }
+  | { kind: 'cat_srt'; videoId: string; chatId: number; expiresAt: number }
+  | { kind: 'cat_epnum'; videoId: string; chatId: number; expiresAt: number }
+  | { kind: 'cat_tags'; videoId: string; chatId: number; expiresAt: number }
   | { kind: 'ser_new'; chatId: number; attachDraftId?: string; expiresAt: number }
   | { kind: 'ser_name'; serieId: number; chatId: number; expiresAt: number }
   | { kind: 'ser_desc'; serieId: number; chatId: number; expiresAt: number }
   | { kind: 'ser_cover'; serieId: number; chatId: number; expiresAt: number }
+  | { kind: 'ser_poster'; serieId: number; chatId: number; expiresAt: number }
   | { kind: 'lis_new'; chatId: number; expiresAt: number }
   | { kind: 'lis_name'; playlistId: number; chatId: number; expiresAt: number }
   | { kind: 'ch_name'; chatId: number; expiresAt: number }
+  | { kind: 'ch_alias'; chatId: number; expiresAt: number }
   | { kind: 'ch_desc'; chatId: number; expiresAt: number }
   | { kind: 'ch_avatar'; chatId: number; expiresAt: number }
   | { kind: 'ch_banner'; chatId: number; expiresAt: number }
+  | { kind: 'ch_switch'; chatId: number; expiresAt: number }
   | { kind: 'com_reply'; commentId: number; pubId: number; chatId: number; expiresAt: number }
   | { kind: 'promo_add'; chatId: number; expiresAt: number }
   | { kind: 'promo_cast'; chatId: number; expiresAt: number }
   | { kind: 'req_add'; chatId: number; expiresAt: number }
+  | { kind: 'picta_search'; chatId: number; expiresAt: number }
+  | { kind: 'colab_add'; chatId: number; expiresAt: number }
+  | { kind: 'pers_add'; chatId: number; expiresAt: number }
+  | { kind: 'tag_add'; chatId: number; expiresAt: number }
+  | { kind: 'al_thresh'; chatId: number; expiresAt: number }
+  | { kind: 'cped_grp'; chatId: number; expiresAt: number }
   | { kind: 'tmdb_search'; chatId: number; expiresAt: number }
   | { kind: 'ai_ask'; chatId: number; expiresAt: number }
   | { kind: 'url_upload'; chatId: number; expiresAt: number }
@@ -413,103 +447,41 @@ export class TelegramBotRuntime {
   // ===========================================================================
 
   private async renderMainMenu(chatId: number, user: AuthorizedUser, editMessageId?: number): Promise<void> {
-    const isMaster = stateStore.isMasterAdmin(user.telegramUserId);
-    const session = stateStore.userSessions.find((s) => s.telegramUserId === user.telegramUserId);
-    const activeChannelLabel = session
-      ? `${session.channelName} (#${session.channelId})`
-      : isMaster
-      ? `${pictaService.getDefaultChannelName()} (#${pictaService.getDefaultChannelId()})`
-      : 'Sin vincular (usa /login)';
-
-    const modeLabel = user.uploadMode === 'fast' ? '⚡ Rápido' : '🧭 Asistente';
-    const activeJobs = stateStore.jobs.filter((j) =>
-      ['queued', 'downloading', 'assembling', 'uploading', 'encoding_nomad'].includes(j.status)
-    ).length;
-    const pendingReqs = stateStore.channelRequests.filter((r) => r.status === 'pending').length;
-    const mt = mtprotoPool.getStatus();
-
-    const text = [
-      `<b>🎬 PictaBot 24/7 — Centro de Control</b>`,
-      ``,
-      `📺 <b>Canal activo:</b> ${escHtml(activeChannelLabel)}`,
-      `⚙️ <b>Modo subida:</b> ${modeLabel} · <b>MTProto:</b> ${mt.connected ? '🟢 Online' : '🟡 Bot API'}`,
-      `📦 <b>Cola:</b> ${activeJobs} activo(s) · <b>Peticiones:</b> ${pendingReqs} · <b>Alertas:</b> ${user.alertsEnabled ? '🔔' : '🔕'}`,
-      `📊 <b>Cuota hoy:</b> ${user.usedTodayGb.toFixed(2)} / ${user.dailyQuotaGb} GB (${user.filesToday}/${user.dailyMaxFiles})`,
-      `✨ <b>IA Gemini:</b> ${isGeminiConfigured() ? '🟢 Activa' : '⚪ Sin GEMINI_API_KEY'}`,
-      ``,
-      `<i>Envía cualquier video o archivo directamente aquí para subirlo, o elige una herramienta:</i>`,
-    ].join('\n');
-
-    const rows: InlineKeyboardButton[][] = [
-      [
-        { text: '🎬 Catálogo', callback_data: 'm:cat:1' },
-        { text: '🏆 Top Videos', callback_data: 'm:top:v' },
-        { text: '📺 Mi Canal', callback_data: 'm:chan' },
-      ],
-      [
-        { text: '📺 Series', callback_data: 'm:ser' },
-        { text: '📋 Listas', callback_data: 'm:lis' },
-        { text: '🔍 TMDB', callback_data: 'm:tmdb' },
-      ],
-      [
-        { text: '💬 Comentarios IA', callback_data: 'm:com:u:0' },
-        { text: `🙋 Peticiones (${pendingReqs})`, callback_data: 'm:req:0' },
-        { text: '🚨 Denuncias', callback_data: 'm:den' },
-      ],
-      [
-        { text: '📢 Promos', callback_data: 'm:prm' },
-        { text: `📥 Cola (${activeJobs})`, callback_data: 'm:col' },
-        { text: '📊 Stats', callback_data: 'm:sta:1' },
-      ],
-      [
-        { text: '🔔 Alertas', callback_data: 'm:ale' },
-        { text: '✨ Asistente IA', callback_data: 'm:ai' },
-        { text: '🧩 Unir / URL', callback_data: 'm:tools' },
-      ],
-      [
-        { text: `Modo: ${modeLabel}`, callback_data: 'm:mode' },
-        { text: '🔑 Cuenta Picta', callback_data: 'm:acc' },
-      ],
-      [
-        ...(this.isAdmin(user) ? [{ text: '🛡️ Admin y Bóveda', callback_data: 'm:adm' }] : []),
-        { text: '❓ Guía / Ayuda', callback_data: 'm:help' },
-      ],
-    ];
-
-    await this.showOrEdit(chatId, editMessageId, text, { inline_keyboard: rows });
+    await renderLegacyMainMenuHud(chatId, user, this.isAdmin(user), editMessageId);
   }
 
   private async renderHelpView(chatId: number, editMessageId?: number): Promise<void> {
     const text = [
       `<b>❓ Guía Completa de PictaBot 24/7</b>`,
       ``,
-      `<b>📤 Subidas y Ensamblaje</b>`,
-      `• Envía cualquier video/documento directo al chat`,
+      `<b>📤 Subidas, Ráfaga y Ensamblaje</b>`,
+      `• Envía cualquier video/documento directo al chat (hasta 4 GB por MTProto)`,
+      `• /series · /rafaga · /fijar — Mis Series y <b>📌 Modo Serie Fija</b> (subida en ráfaga automática)`,
       `• /modo — Alternar Asistente completo / Rápido automático`,
       `• /url <code>&lt;enlace&gt;</code> — Subir video desde enlace directo HTTP/S`,
       `• /unir <code>[título]</code> + /unir_fin — Unir partes (.001/.002), ZIP o TAR`,
-      `• /cola — Ver progreso, errores, pausar o reintentar fallidos`,
+      `• /cola · /reintentar — Ver progreso, pausar o reintentar fallidos reutilizando S3 en 1s`,
       ``,
-      `<b>🎬 Gestión del Canal y Catálogo</b>`,
-      `• /catalogo <code>[buscar]</code> — Explorar, filtrar, ordenar y editar videos`,
-      `• /top — Ranking de videos más vistos, likes, comentarios y descargas`,
-      `• /canal — Ver y editar perfil, avatar y banner de tu canal`,
-      `• /series — Crear, editar, fijar, rellenar con TMDB y ver capítulos`,
-      `• /listas — Crear listas, añadir/quitar videos y editar visibilidad`,
+      `<b>🏛️ Estudio de Canal, Catálogo y Auditoría</b>`,
+      `• /canal <code>[url|slug|id]</code> — Estudio de Canal (nombre, alias, edad, ocultar, donaciones, avatar, banner)`,
+      `• /stats · /catalogo · /top — Dashboard de Picta, métricas y gestor de videos (con subtítulos .srt y Puerta Trasera MP4/HLS)`,
+      `• /buscar <code>&lt;título&gt;</code> — Buscador Global en todo Picta (videos y series)`,
+      `• /auditoria · /saludcanal — Auditoría de Salud (Duplicados, Incompletos, Sin publicar, Capítulos sueltos)`,
+      `• /colaboradores · /asociados — Añadir o quitar colaboradores de tu canal`,
+      `• /personas · /actores · /etiquetas — Registrar o buscar actores, directores y etiquetas en Picta`,
+      `• /listas — Crear listas de reproducción, añadir/quitar videos y visibilidad`,
       ``,
-      `<b>💬 Comunidad, IA y Promoción</b>`,
-      `• /comentarios — Leer y responder con sugerencias Gemini IA`,
-      `• /peticiones — Peticiones de audiencia detectadas automáticamente`,
-      `• /denuncias — Resumen y listado de denuncias del canal`,
-      `• /promos — Canales promocionales, auto-post y difusión personalizada`,
-      `• /ia <code>&lt;consulta&gt;</code> — Pedir sinopsis, títulos, promos o hashtags a Gemini`,
-      `• /buscar <code>&lt;título&gt;</code> — Consultar ficha en TMDB`,
+      `<b>💬 Comunidad, Pedidos, Logros e IA</b>`,
+      `• /comentarios · /denuncias — Responder comentarios (manual o Gemini IA) y ver denuncias`,
+      `• /pedidos · /pedir <code>[título]</code> — Gestor de pedidos con verificador directo en Picta`,
+      `• /canalpedidos · /promocion — Canal de difusión y Grupo de Pedidos con Auto-Verificador`,
+      `• /logros · /alertas · /metas — Logros progresivos (Reprod., Likes, Descargas, Comentarios)`,
+      `• /ia <code>&lt;consulta&gt;</code> — Consultar a Gemini IA`,
       ``,
-      `<b>📊 Métricas, Cuenta y Sistema</b>`,
-      `• /stats — Métricas del canal (Hoy / 7 días / 30 días)`,
-      `• /alertas — Centro de alertas e hitos de vistas`,
-      `• /login · /mis_canales · /logout — Multiusuario aislado`,
-      `• /cuota · /disco · /admin · /backup · /restaurar_nube`,
+      `<b>⚡ Cuota 10/día Cuba, Pool Multi-Cuenta y Sistema</b>`,
+      `• /cuota · /pool · /cuentas — Cuota 10/día Cuba, reparto Series/Pelis y Pool Multi-Cuenta (+10/día)`,
+      `• /cuenta · /login · /logout — Diagnóstico de cuenta en vivo (rol Jefe de canal) y sesión aislada`,
+      `• /disco · /admin · /usuarios · /backup · /restaurar_nube`,
     ].join('\n');
 
     await this.showOrEdit(chatId, editMessageId, text, {
@@ -688,7 +660,7 @@ export class TelegramBotRuntime {
       res.items.forEach((item, idx) => {
         const vis = item.publicado ? '🟢' : '🔒';
         lines.push(
-          `${idx + 1}. ${vis} <b>${escHtml(item.nombre.slice(0, 52))}</b>\n   👁 ${fmtNum(item.cantidad_vistas)} · ❤️ ${fmtNum(item.cantidad_me_gusta)} · 💬 ${item.cantidad_comentarios} · ${escHtml(item.tipologiaNombre)}`
+          `${idx + 1}. ${vis} <b>${escHtml(item.nombre.slice(0, 52))}</b>\n   👁 ${fmtNum(item.cantidad_vistas)} · ▶️ ${fmtNum(item.cantidad_reproducciones || 0)} · ❤️ ${fmtNum(item.cantidad_me_gusta)} · 💬 ${item.cantidad_comentarios}`
         );
         rows.push([{ text: `${idx + 1}. ${vis} ${item.nombre.slice(0, 36)}`, callback_data: `cv:${item.id}` }]);
       });
@@ -700,7 +672,7 @@ export class TelegramBotRuntime {
     if (filter.search) navRow.push({ text: '✖️ Limpiar', callback_data: 'cf:clr' });
     if (res.hasNext) navRow.push({ text: 'Sig. ➡️', callback_data: `m:cat:${page + 1}` });
     rows.push(navRow);
-    rows.push([{ text: '🏠 Menú Principal', callback_data: 'm:home' }]);
+    rows.push([{ text: '📊 Estadísticas', callback_data: 'm:sta:1' }, { text: '🏠 Menú', callback_data: 'm:home' }]);
 
     await this.showOrEdit(chatId, editMessageId, lines.join('\n'), { inline_keyboard: rows });
   }
@@ -722,11 +694,21 @@ export class TelegramBotRuntime {
       return;
     }
 
+    const epTag =
+      item.tipologiaId === 5 || item.serieId
+        ? ` · 📺 T${item.temporada || '1'}:E${item.numero || '1'}`
+        : '';
+    const subTag = item.url_subtitulo ? '🟢 Subtítulos .SRT' : '⚪ Sin subtítulos';
+    const coverTag = item.url_imagen ? '🖼️ Portada OK' : '⚠️ Sin portada';
+    const posterTag = item.imagen_secundaria ? '🎞️ Póster OK' : '⚪ Sin póster';
+
     const text = [
       `<b>🎬 ${escHtml(item.nombre)}</b>`,
-      `🆔 ID: <code>${escHtml(item.id)}</code> · 📂 ${escHtml(item.tipologiaNombre)} · 🔞 ${escHtml(item.clasificacion)}`,
-      `👁 ${fmtNum(item.cantidad_vistas)} vistas · ❤️ ${fmtNum(item.cantidad_me_gusta)} likes · 💬 ${item.cantidad_comentarios} com. · ⬇️ ${fmtNum(item.cantidad_descargas)} desc.`,
-      `⚙️ ${item.publicado ? '🟢 Publicado' : '🔒 Oculto'} · ${item.descargable ? '⬇️ Descargable' : '🚫 Solo stream'}${item.estado_codificacion ? ` · Nomad: ${escHtml(item.estado_codificacion)}` : ''}`,
+      `🆔 ID: <code>${escHtml(item.id)}</code> · 📂 ${escHtml(item.tipologiaNombre)} · 🔞 ${escHtml(item.clasificacion)}${epTag}`,
+      `👁 ${fmtNum(item.cantidad_vistas)} vistas · ▶️ ${fmtNum(item.cantidad_reproducciones || 0)} reprod. · ❤️ ${fmtNum(item.cantidad_me_gusta)} likes · 💬 ${item.cantidad_comentarios} com. · ⬇️ ${fmtNum(item.cantidad_descargas)} desc.`,
+      `⚙️ ${item.publicado ? '🟢 Publicado' : '🔒 Oculto'} · ${item.descargable ? '⬇️ Descargable' : '🚫 Solo stream'} · Nomad: ${escHtml(item.estado_codificacion || (item.convertido ? 'convertido' : 'procesando'))}`,
+      `🎨 ${coverTag} · ${posterTag} · 💬 ${subTag}`,
+      ...(item.motivo_rechazo ? [`🚨 <b>Motivo rechazo:</b> ${escHtml(item.motivo_rechazo)}`] : []),
       ``,
       `📝 ${escHtml(item.descripcion ? item.descripcion.slice(0, 440) : 'Sin sinopsis')}`,
       ``,
@@ -736,36 +718,45 @@ export class TelegramBotRuntime {
     const markup: InlineKeyboardMarkup = {
       inline_keyboard: [
         [
-          { text: '✏️ Título', callback_data: `ce:t:${item.id}` },
-          { text: '📝 Sinopsis', callback_data: `ce:d:${item.id}` },
-          { text: '🖼️ Portada', callback_data: `ce:cov:${item.id}` },
+          { text: '✏️ Cambiar Título', callback_data: `ce:t:${item.id}` },
+          { text: '📝 Cambiar Descripción', callback_data: `ce:d:${item.id}` },
         ],
         [
+          { text: '🖼️ Cambiar Portada', callback_data: `ce:cov:${item.id}` },
+          { text: '🎞️ Cambiar Póster', callback_data: `ce:pos:${item.id}` },
+        ],
+        [
+          { text: '🎬 TMDB (Portada+Póster+Sinopsis)', callback_data: `ce:tmdb:${item.id}` },
           { text: '✨ Pulir con IA', callback_data: `ce:ai:${item.id}` },
-          { text: '🎬 TMDB Top-3', callback_data: `ce:tmdb:${item.id}` },
+        ],
+        [
+          { text: '💬 Añadir Subtítulos (.srt)', callback_data: `ce:srt:${item.id}` },
+          { text: '🔢 Cambiar Nº Cap. / Temp.', callback_data: `ce:epn:${item.id}` },
         ],
         [
           { text: '📂 Tipología', callback_data: `ce:tip:${item.id}` },
           { text: `🔞 ${item.clasificacion}`, callback_data: `ce:cla:${item.id}` },
+          { text: '🏷️ Etiquetas', callback_data: `ce:tag:${item.id}` },
+        ],
+        [
+          { text: '🚪 Descarga Directa (Puerta Trasera)', callback_data: `ce:bdoor:${item.id}` },
+          { text: '📂 Añadir a Lista', callback_data: `ce:lis:${item.id}` },
         ],
         [
           { text: '📺 Mover a Serie', callback_data: `ce:ser:${item.id}` },
-          { text: '📋 Añadir a Lista', callback_data: `ce:lis:${item.id}` },
-        ],
-        [
-          { text: item.publicado ? '🔒 Ocultar' : '👁️ Publicar', callback_data: `ce:pub:${item.id}` },
-          { text: item.descargable ? '🚫 Sin descarga' : '⬇️ Descargable', callback_data: `ce:dl:${item.id}` },
+          { text: item.descargable ? '📥 Descarga: Permitida' : '🚫 Descarga: Bloqueada', callback_data: `ce:dl:${item.id}` },
         ],
         [
           { text: `💬 Comentarios (${item.cantidad_comentarios})`, callback_data: `cvc:${item.id}` },
-          { text: '🖼️ Ficha + Foto', callback_data: `ce:card:${item.id}` },
+          { text: '📢 Difundir Promo', callback_data: `ce:prm:${item.id}` },
         ],
         [
-          { text: '📢 Difundir Promo', callback_data: `ce:prm:${item.id}` },
-          { text: '🗑️ Eliminar', callback_data: `ce:del:${item.id}` },
+          { text: item.publicado ? '🙈 Ocultar Video' : '🟢 Publicar Video', callback_data: `ce:pub:${item.id}` },
+          { text: '🗑️ Eliminar Video', callback_data: `ce:del:${item.id}` },
         ],
         [
           { text: '⬅️ Catálogo', callback_data: 'm:cat:1' },
+          { text: '📊 Stats', callback_data: 'm:sta:1' },
           { text: '🏠 Menú', callback_data: 'm:home' },
         ],
       ],
@@ -829,7 +820,7 @@ export class TelegramBotRuntime {
       sorted.slice(0, 8).forEach((item, idx) => {
         const medal = idx === 0 ? '🥇' : idx === 1 ? '🥈' : idx === 2 ? '🥉' : `${idx + 1}.`;
         lines.push(
-          `${medal} <b>${escHtml(item.nombre.slice(0, 48))}</b>\n   👁 ${fmtNum(item.cantidad_vistas)} · ❤️ ${fmtNum(item.cantidad_me_gusta)} · 💬 ${item.cantidad_comentarios} · ⬇️ ${fmtNum(item.cantidad_descargas)}`
+          `${medal} <b>${escHtml(item.nombre.slice(0, 48))}</b>\n   👁 ${fmtNum(item.cantidad_vistas)} · ▶️ ${fmtNum(item.cantidad_reproducciones || 0)} · ❤️ ${fmtNum(item.cantidad_me_gusta)} · ⬇️ ${fmtNum(item.cantidad_descargas)}`
         );
         rows.push([{ text: `${medal} Abrir: ${item.nombre.slice(0, 34)}`, callback_data: `cv:${item.id}` }]);
       });
@@ -857,31 +848,47 @@ export class TelegramBotRuntime {
     }
 
     const text = [
-      `<b>📺 Mi Canal de Picta</b>`,
+      `<b>🏛️ Estudio de Canal — Picta</b>`,
       ``,
       `🏷️ <b>Nombre:</b> ${escHtml(profile.nombre)}`,
-      `🆔 <b>ID:</b> <code>${profile.id}</code>${profile.alias ? ` · <b>Alias:</b> @${escHtml(profile.alias)}` : ''}`,
+      `🆔 <b>ID:</b> <code>${profile.id}</code> · <b>Alias/URL:</b> ${profile.alias ? `@${escHtml(profile.alias)}` : '<i>Sin alias</i>'}`,
       `👥 <b>Suscriptores:</b> ${fmtNum(profile.cantidad_suscriptores)} · 🎬 <b>Videos:</b> ${fmtNum(profile.cantidad_publicaciones)}`,
-      `🔞 <b>Clasificación:</b> ${escHtml(profile.clasificacion)} · ${profile.publicado ? '🟢 Público' : '🔒 Oculto'}`,
+      `🔞 <b>Clasificación:</b> ${escHtml(profile.clasificacion)} · <b>Estado:</b> ${profile.publicado ? '🟢 Público' : '🙈 Oculto'}`,
+      `💳 <b>Donaciones:</b> ${profile.donacion ? '🟢 Activas' : '⚪ Pausadas'} · 🤝 <b>Asociados:</b> ${profile.usuariosAsociados?.length || 0}`,
       ``,
-      `📝 <b>Descripción:</b>\n${escHtml(profile.descripcion ? profile.descripcion.slice(0, 420) : 'Sin descripción')}`,
+      `📝 <b>Biografía / Descripción:</b>\n${escHtml(profile.descripcion ? profile.descripcion.slice(0, 420) : 'Sin descripción')}`,
     ].join('\n');
 
     await this.showOrEdit(chatId, editMessageId, text, {
       inline_keyboard: [
         [
           { text: '✏️ Editar Nombre', callback_data: 'chp:name' },
-          { text: '📝 Editar Descripción', callback_data: 'chp:desc' },
+          { text: '🔗 Editar Alias', callback_data: 'chp:alias' },
+        ],
+        [
+          { text: '📝 Editar Biografía', callback_data: 'chp:desc' },
+          { text: `🔞 Edad: ${profile.clasificacion}`, callback_data: 'chp:cla' },
         ],
         [
           { text: '🖼️ Cambiar Avatar', callback_data: 'chp:ava' },
-          { text: '🎨 Cambiar Banner', callback_data: 'chp:ban' },
+          { text: '🎨 Cambiar Portada', callback_data: 'chp:ban' },
         ],
         [
-          { text: '🏆 Top Videos', callback_data: 'm:top:v' },
-          { text: '📊 Estadísticas', callback_data: 'm:sta:1' },
+          { text: profile.publicado ? '🙈 Ocultar Canal' : '🟢 Hacer Público', callback_data: 'chp:pub' },
+          { text: profile.donacion ? '💳 Pausar Donaciones' : '💳 Activar Donaciones', callback_data: 'chp:don' },
         ],
-        [{ text: '🔑 Cambiar de Canal', callback_data: 'm:acc' }, { text: '🏠 Menú', callback_data: 'm:home' }],
+        [
+          { text: '👥 Colaboradores', callback_data: 'lg:colab' },
+          { text: '🎭 Actores y Tags', callback_data: 'lg:pers' },
+        ],
+        [
+          { text: '🩺 Auditoría Canal', callback_data: 'lg:audit:dup:1' },
+          { text: '📊 Videos y Stats', callback_data: 'm:sta:1' },
+        ],
+        [
+          { text: '🔄 Cambiar Canal (URL/ID)', callback_data: 'lg:chswitch' },
+          { text: '🏠 Menú Principal', callback_data: 'm:home' },
+        ],
       ],
     });
   }
@@ -896,18 +903,31 @@ export class TelegramBotRuntime {
     }
 
     const series = await pictaService.fetchChannelSeries(ctx);
+    const pinnedBatch = stateStore.getPinnedSerieForUser(userId);
+
     const lines = [
-      `<b>📺 Series — ${escHtml(ctx.channelName)}</b>`,
-      `Total: <b>${series.length}</b> serie(s). Toca una serie para ver capítulos, editar, portada o TMDB.`,
+      `<b>📺 Mis Series y Modo Ráfaga — ${escHtml(ctx.channelName)}</b>`,
+      `Total: <b>${series.length}</b> serie(s).`,
+      ...(pinnedBatch
+        ? [
+            `📌 <b>Modo Serie Fija ACTIVO:</b> <b>${escHtml(pinnedBatch.serieName)}</b> (T${pinnedBatch.seasonNum} · Próx. Cap. ${pinnedBatch.nextEpisodeNumber || 'Auto'})`,
+            `<i>Todo video que envíes al chat se subirá automáticamente a esta serie y temporada.</i>`,
+          ]
+        : [`<i>Toca una serie para ver capítulos, crear temporadas o activar el 📌 Modo Serie Fija (subida en ráfaga).</i>`]),
       ``,
     ];
     const rows: InlineKeyboardButton[][] = [];
+
+    if (pinnedBatch) {
+      rows.push([{ text: `📌 Desactivar Serie Fija (${pinnedBatch.serieName.slice(0, 22)})`, callback_data: 'ser:unpinbatch' }]);
+    }
 
     if (series.length === 0) {
       lines.push('No hay series creadas en este canal todavía.');
     } else {
       series.slice(0, 12).forEach((s) => {
-        const pinIcon = s.pinned ? '📌 ' : '';
+        const isBatch = pinnedBatch?.serieId === s.id;
+        const pinIcon = isBatch ? '📌 ' : s.pinned ? '⭐ ' : '';
         lines.push(`${pinIcon}<b>${escHtml(s.nombre)}</b> · ${s.cantidad_capitulos} cap.`);
         rows.push([{ text: `${pinIcon}${s.nombre.slice(0, 32)} (${s.cantidad_capitulos} cap)`, callback_data: `sd:${s.id}` }]);
       });
@@ -938,34 +958,59 @@ export class TelegramBotRuntime {
       return;
     }
 
+    const pinnedBatch = stateStore.getPinnedSerieForUser(userId);
+    const isThisPinnedBatch = pinnedBatch?.serieId === s.id;
+    const seasons = s.seasons && s.seasons.length > 0 ? s.seasons : [{ id: 0, numero: 1, nombre: 'Temporada 1' }];
+    const activeSeason = seasons[seasons.length - 1];
+    const nextSeasonNum = Math.max(...seasons.map((t) => t.numero), 1) + 1;
+
     const lines = [
-      `<b>📺 ${escHtml(s.nombre)}</b> ${s.pinned ? '📌' : ''}`,
-      `🆔 ID: <code>${s.id}</code> · Capítulos: <b>${Math.max(s.cantidad_capitulos, episodes.length)}</b> · ${s.publicado ? '🟢 Pública' : '🔒 Oculta'}`,
+      `<b>📺 ${escHtml(s.nombre)}</b> ${isThisPinnedBatch ? '📌 [MODO SERIE FIJA]' : ''}`,
+      `🆔 ID: <code>${s.id}</code> · Capítulos: <b>${Math.max(s.cantidad_capitulos, episodes.length)}</b> · Temporadas: <b>${seasons.length}</b> · ${s.publicado ? '🟢 Pública' : '🔒 Oculta'}`,
+      ...(isThisPinnedBatch
+        ? [`📌 <b>Ráfaga Activa:</b> Temporada ${pinnedBatch.seasonNum} · Próximo Capítulo: <b>#${pinnedBatch.nextEpisodeNumber || episodes.length + 1}</b>`]
+        : []),
       ``,
       `📝 ${escHtml(s.descripcion ? s.descripcion.slice(0, 320) : 'Sin sinopsis')}`,
     ];
 
     const rows: InlineKeyboardButton[][] = [
       [
-        { text: s.pinned ? '📌 Desfijar' : '📍 Fijar Favorita', callback_data: `ser:pin:${s.id}` },
-        { text: '🎬 TMDB (Sinopsis+Foto)', callback_data: `ser:tmdb:${s.id}` },
+        {
+          text: isThisPinnedBatch
+            ? `📌 Desactivar Modo Serie Fija`
+            : `📌 Activar Modo Serie Fija (T${activeSeason.numero})`,
+          callback_data: `ser:batch:${s.id}:${activeSeason.numero}:${activeSeason.id || 0}`,
+        },
       ],
       [
-        { text: '✏️ Nombre', callback_data: `ser:nam:${s.id}` },
-        { text: '📝 Sinopsis', callback_data: `ser:des:${s.id}` },
-        { text: '🖼️ Portada', callback_data: `ser:cov:${s.id}` },
+        { text: `➕ Crear Temporada ${nextSeasonNum}`, callback_data: `ser:newsea:${s.id}:${nextSeasonNum}` },
+        { text: '🎬 TMDB (Portada+Póster+Sinopsis)', callback_data: `ser:tmdb:${s.id}` },
       ],
       [
-        { text: s.publicado ? '🔒 Ocultar' : '👁 Publicar', callback_data: `ser:pub:${s.id}` },
+        { text: '✏️ Nombre Serie', callback_data: `ser:nam:${s.id}` },
+        { text: '📝 Sinopsis Serie', callback_data: `ser:des:${s.id}` },
+      ],
+      [
+        { text: '🖼️ Portada Serie', callback_data: `ser:cov:${s.id}` },
+        { text: '🎞️ Póster Serie', callback_data: `ser:pos:${s.id}` },
+      ],
+      [
+        { text: s.publicado ? '🔒 Ocultar Serie' : '👁 Publicar Serie', callback_data: `ser:pub:${s.id}` },
         { text: '🗑️ Eliminar Serie', callback_data: `ser:del:${s.id}` },
       ],
     ];
 
     if (episodes.length > 0) {
-      lines.push(``, `<b>Capítulos recientes (${episodes.length}):</b>`);
-      episodes.slice(0, 5).forEach((ep, i) => {
-        lines.push(`${i + 1}. ${escHtml(ep.nombre.slice(0, 48))} (👁 ${fmtNum(ep.cantidad_vistas)})`);
-        rows.push([{ text: `🎬 ${ep.nombre.slice(0, 38)}`, callback_data: `cv:${ep.id}` }]);
+      lines.push(``, `<b>Capítulos (${episodes.length}):</b>`);
+      episodes.slice(0, 6).forEach((ep, i) => {
+        const epCode = `T${ep.temporada || '1'}:E${String(ep.numero || i + 1).padStart(2, '0')}`;
+        lines.push(`${i + 1}. <b>[${escHtml(epCode)}]</b> ${escHtml(ep.nombre.slice(0, 44))} (👁 ${fmtNum(ep.cantidad_vistas)})`);
+        rows.push([
+          { text: `🛠️ ${epCode} ${ep.nombre.slice(0, 22)}`, callback_data: `cv:${ep.id}` },
+          { text: '🔢 Nº', callback_data: `ce:epn:${ep.id}` },
+          { text: '🗑️', callback_data: `ce:del:${ep.id}` },
+        ]);
       });
     }
 
@@ -1142,43 +1187,74 @@ export class TelegramBotRuntime {
     await this.showOrEdit(chatId, editMessageId, text, { inline_keyboard: rows });
   }
 
-  private async renderRequestsView(chatId: number, page: number, editMessageId?: number): Promise<void> {
-    const pending = stateStore.channelRequests.filter((r) => r.status === 'pending');
-    const resolvedCount = stateStore.channelRequests.length - pending.length;
+  private async renderRequestsView(
+    chatId: number,
+    page: number,
+    editMessageId?: number,
+    tab: 'pending' | 'fulfilled' = 'pending'
+  ): Promise<void> {
+    const pendingList = stateStore.channelRequests.filter((r) => r.status === 'pending');
+    const fulfilledList = stateStore.channelRequests.filter((r) => r.status === 'fulfilled');
+    const activeList = tab === 'fulfilled' ? fulfilledList : pendingList;
+
     const lines = [
-      `<b>🙋 Peticiones de Audiencia</b> (${pending.length} pendiente(s) · ${resolvedCount} resueltas)`,
+      `<b>📥 Gestor de Pedidos (/pedidos)</b>`,
+      `⏳ Pendientes: <b>${pendingList.length}</b> · ✅ Cumplidos: <b>${fulfilledList.length}</b>`,
       ``,
     ];
-    const rows: InlineKeyboardButton[][] = [];
+    const rows: InlineKeyboardButton[][] = [
+      [
+        {
+          text: tab === 'pending' ? `• ⏳ Pendientes (${pendingList.length}) •` : `⏳ Pendientes (${pendingList.length})`,
+          callback_data: 'm:req:0:p',
+        },
+        {
+          text: tab === 'fulfilled' ? `• ✅ Cumplidos (${fulfilledList.length}) •` : `✅ Cumplidos (${fulfilledList.length})`,
+          callback_data: 'm:req:0:f',
+        },
+      ],
+    ];
 
-    if (pending.length === 0) {
-      lines.push('No hay peticiones pendientes. Se capturan automáticamente al revisar /comentarios o puedes agregar una manual.');
+    if (activeList.length === 0) {
+      lines.push(
+        tab === 'pending'
+          ? 'No hay pedidos pendientes. Se capturan automáticamente desde el Grupo de Pedidos (/canalpedidos), desde /comentarios o con /pedir [título].'
+          : 'Todavía no hay pedidos marcados como cumplidos.'
+      );
     } else {
       const start = page * 4;
-      const slice = pending.slice(start, start + 4);
+      const slice = activeList.slice(start, start + 4);
       slice.forEach((req, idx) => {
         const globalIdx = start + idx;
         lines.push(
-          `${globalIdx + 1}. <b>${escHtml(req.requestedTitle)}</b>\n   👤 ${escHtml(req.requesterName)} en <i>${escHtml(req.sourceVideoTitle.slice(0, 35))}</i>\n   “${escHtml(req.rawText.slice(0, 120))}”`
+          `${globalIdx + 1}. <b>${escHtml(req.requestedTitle)}</b>\n   👤 ${escHtml(req.requesterName)} (${escHtml(req.sourceVideoTitle.slice(0, 32))})\n   “${escHtml(req.rawText.slice(0, 120))}”`
         );
         rows.push([
-          { text: `✅ #${globalIdx + 1}`, callback_data: `rq:ok:${req.id.slice(0, 12)}` },
+          { text: `🔎 Picta #${globalIdx + 1}`, callback_data: `rq:chk:${req.id.slice(0, 12)}` },
+          ...(tab === 'pending'
+            ? [{ text: `✅ Cumplido #${globalIdx + 1}`, callback_data: `rq:ok:${req.id.slice(0, 12)}` }]
+            : []),
           { text: `🎬 TMDB #${globalIdx + 1}`, callback_data: `rq:tm:${req.id.slice(0, 12)}` },
           { text: `🗑️ #${globalIdx + 1}`, callback_data: `rq:ign:${req.id.slice(0, 12)}` },
         ]);
       });
 
       const nav: InlineKeyboardButton[] = [];
-      if (page > 0) nav.push({ text: '⬅️ Anterior', callback_data: `m:req:${page - 1}` });
-      if (start + 4 < pending.length) nav.push({ text: 'Siguiente ➡️', callback_data: `m:req:${page + 1}` });
+      const tabCode = tab === 'fulfilled' ? 'f' : 'p';
+      if (page > 0) nav.push({ text: '⬅️ Anterior', callback_data: `m:req:${page - 1}:${tabCode}` });
+      if (start + 4 < activeList.length) nav.push({ text: 'Siguiente ➡️', callback_data: `m:req:${page + 1}:${tabCode}` });
       if (nav.length > 0) rows.push(nav);
     }
 
     rows.push([
-      { text: '➕ Agregar Manual', callback_data: 'rq:add' },
-      ...(resolvedCount > 0 ? [{ text: '🧹 Limpiar resueltas', callback_data: 'rq:clr' }] : []),
+      { text: '➕ Anotar Pedido (/pedir)', callback_data: 'rq:add' },
+      { text: '📢 Canal de Pedidos', callback_data: 'lg:cped' },
     ]);
-    rows.push([{ text: '💬 Revisar Comentarios', callback_data: 'm:com:u:0' }, { text: '🏠 Menú', callback_data: 'm:home' }]);
+    rows.push([
+      { text: '🔄 Escanear Comentarios', callback_data: 'm:com:r:0' },
+      ...(fulfilledList.length > 0 ? [{ text: '🧹 Limpiar cumplidos', callback_data: 'rq:clr' }] : []),
+      { text: '🏠 Menú', callback_data: 'm:home' },
+    ]);
     await this.showOrEdit(chatId, editMessageId, lines.join('\n'), { inline_keyboard: rows });
   }
 
@@ -1242,7 +1318,11 @@ export class TelegramBotRuntime {
       rows.push([{ text: '📣 Enviar Promo Personalizada a Todos', callback_data: 'pr:cast' }]);
     }
 
-    rows.push([{ text: '➕ Agregar Canal Promo', callback_data: 'pr:add' }, { text: '🏠 Menú', callback_data: 'm:home' }]);
+    rows.push([
+      { text: '➕ Agregar Canal Promo', callback_data: 'pr:add' },
+      { text: '📢 Grupo de Pedidos', callback_data: 'lg:cped' },
+      { text: '🏠 Menú', callback_data: 'm:home' },
+    ]);
     await this.showOrEdit(chatId, editMessageId, lines.join('\n'), { inline_keyboard: rows });
   }
 
@@ -1270,18 +1350,18 @@ export class TelegramBotRuntime {
     const parsedStats = extractStatMetrics(stats);
 
     const sampleViews = recentPubs.items.reduce((acc, p) => acc + p.cantidad_vistas, 0);
+    const samplePlays = recentPubs.items.reduce((acc, p) => acc + (p.cantidad_reproducciones || 0), 0);
     const sampleLikes = recentPubs.items.reduce((acc, p) => acc + p.cantidad_me_gusta, 0);
     const sampleComments = recentPubs.items.reduce((acc, p) => acc + p.cantidad_comentarios, 0);
     const sampleDownloads = recentPubs.items.reduce((acc, p) => acc + p.cantidad_descargas, 0);
 
     const lines = [
-      `<b>📊 Estadísticas — ${escHtml(profile?.nombre || ctx.channelName)}</b>`,
+      `<b>📊 Videos y Estadísticas — ${escHtml(profile?.nombre || ctx.channelName)}</b>`,
       `Período seleccionado: <b>${periodLabel}</b>`,
       ``,
       ...(profile
         ? [
-            `👥 <b>Suscriptores totales:</b> ${fmtNum(profile.cantidad_suscriptores)}`,
-            `🎬 <b>Publicaciones totales:</b> ${fmtNum(profile.cantidad_publicaciones)}`,
+            `👥 <b>Suscriptores totales:</b> ${fmtNum(profile.cantidad_suscriptores)} · 🎬 <b>Publicaciones:</b> ${fmtNum(profile.cantidad_publicaciones)}`,
           ]
         : []),
       ``,
@@ -1291,55 +1371,42 @@ export class TelegramBotRuntime {
         : ['• Sin desglose diario reportado por la API para este rango.']),
       ``,
       `<b>🎞️ Rendimiento últimos ${recentPubs.items.length} videos:</b>`,
-      `• 👁 Vistas: <b>${fmtNum(sampleViews)}</b> · ❤️ Likes: <b>${fmtNum(sampleLikes)}</b>`,
-      `• 💬 Comentarios: <b>${fmtNum(sampleComments)}</b> · ⬇️ Descargas: <b>${fmtNum(sampleDownloads)}</b>`,
+      `• 👁 Vistas: <b>${fmtNum(sampleViews)}</b> · ▶️ Reprod.: <b>${fmtNum(samplePlays)}</b>`,
+      `• ❤️ Likes: <b>${fmtNum(sampleLikes)}</b> · 💬 Coment.: <b>${fmtNum(sampleComments)}</b> · ⬇️ Desc.: <b>${fmtNum(sampleDownloads)}</b>`,
+      ``,
+      `<b>🎬 Últimos videos (toca uno para editar o ver Puerta Trasera):</b>`,
+      ...recentPubs.items.slice(0, 5).map(
+        (v, i) =>
+          `${i + 1}. ${v.publicado ? '🟢' : '🔒'} <b>${escHtml(v.nombre.slice(0, 42))}</b> (👁 ${fmtNum(v.cantidad_vistas)} · ▶️ ${fmtNum(v.cantidad_reproducciones || 0)})`
+      ),
     ];
+
+    const videoRows: InlineKeyboardButton[][] = recentPubs.items.slice(0, 5).map((v, i) => [
+      { text: `${i + 1}. 🛠️ ${v.nombre.slice(0, 34)}`, callback_data: `cv:${v.id}` },
+    ]);
 
     await this.showOrEdit(chatId, editMessageId, lines.join('\n'), {
       inline_keyboard: [
         [
           { text: days === 1 ? '• Hoy •' : '📅 Hoy', callback_data: 'm:sta:1' },
-          { text: days === 7 ? '• 7 días •' : '📆 7 días', callback_data: 'm:sta:7' },
-          { text: days === 30 ? '• 30 días •' : '🗓️ 30 días', callback_data: 'm:sta:30' },
+          { text: days === 7 ? '• 7 Días •' : '📆 7 Días', callback_data: 'm:sta:7' },
+          { text: days === 30 ? '• 30 Días •' : '🗓️ 30 Días', callback_data: 'm:sta:30' },
+        ],
+        ...videoRows,
+        [
+          { text: '🎬 Catálogo Completo', callback_data: 'm:cat:1' },
+          { text: '🏆 Top Videos', callback_data: 'm:top:v' },
         ],
         [
-          { text: '🏆 Top Videos', callback_data: 'm:top:v' },
-          { text: '🔔 Centro de Alertas', callback_data: 'm:ale' },
+          { text: '🩺 Auditoría Canal', callback_data: 'lg:audit:dup:1' },
+          { text: '🏠 Menú Principal', callback_data: 'm:home' },
         ],
-        [{ text: '🏠 Menú Principal', callback_data: 'm:home' }],
       ],
     });
   }
 
   private async renderAlertsView(chatId: number, user: AuthorizedUser, editMessageId?: number): Promise<void> {
-    const recent = stateStore.alerts.slice(0, 8);
-    const lines = [
-      `<b>🔔 Centro de Alertas e Hitos</b>`,
-      `Tus notificaciones: <b>${user.alertsEnabled ? '🔔 Activas' : '🔕 Silenciadas'}</b>`,
-      `Videos vigilados: <b>${stateStore.watchedVideos.length}</b> · Intervalo: <b>${Math.round(stateStore.config.alertsIntervalMs / 60_000)} min</b>`,
-      ``,
-      `<b>Últimas alertas detectadas (${stateStore.alerts.length}):</b>`,
-      ...(recent.length > 0
-        ? recent.map(
-            (a) =>
-              `• ${a.type === 'milestone' ? '🏆' : '💬'} <b>${escHtml(a.videoTitle.slice(0, 32))}</b> — ${escHtml(a.summary)}`
-          )
-        : ['• Sin alertas registradas todavía.']),
-    ];
-
-    await this.showOrEdit(chatId, editMessageId, lines.join('\n'), {
-      inline_keyboard: [
-        [
-          { text: user.alertsEnabled ? '🔕 Silenciar mis alertas' : '🔔 Activar mis alertas', callback_data: 'al:tog' },
-          { text: '🔎 Escanear ahora', callback_data: 'al:scan' },
-        ],
-        [
-          { text: '🔁 Barrido Nomad', callback_data: 'al:nomad' },
-          ...(stateStore.alerts.length > 0 ? [{ text: '🧹 Limpiar historial', callback_data: 'al:clr' }] : []),
-        ],
-        [{ text: '🏠 Menú Principal', callback_data: 'm:home' }],
-      ],
-    });
+    await renderLogrosAndAlertsHud(chatId, user, editMessageId);
   }
 
   private async renderQueueView(chatId: number, user: AuthorizedUser, editMessageId?: number): Promise<void> {
@@ -1347,10 +1414,12 @@ export class TelegramBotRuntime {
     const recent = stateStore.jobs.slice(0, 8);
     const failedCount = stateStore.jobs.filter((j) => j.status === 'failed').length;
     const pendingCount = stateStore.jobs.filter((j) => j.status === 'queued').length;
+    const pinned = stateStore.getPinnedSerieForUser(user.telegramUserId);
 
     const lines = [
-      `<b>📥 Cola de Subidas y Disco</b>`,
+      `<b>📋 Cola de Subidas y Disco</b>`,
       `Estado: <b>${stateStore.config.queuePaused ? '⏸️ Pausada' : '▶️ Activa'}</b> · Disco: <b>${disk.usagePct}%</b> (${fmtGb(disk.budgetRemainingBytes)} libres)`,
+      ...(pinned ? [`📌 <b>Serie Fija Activa:</b> ${escHtml(pinned.serieName)} (T${pinned.seasonNum})`] : []),
       ``,
     ];
 
@@ -1369,7 +1438,8 @@ export class TelegramBotRuntime {
             ? '⚙️'
             : '⏳';
         const spd = j.speedMbps ? ` · ${j.speedMbps} MB/s` : '';
-        lines.push(`${icon} <b>${escHtml(j.title.slice(0, 38))}</b> [${j.status}] ${j.progressPct}%${spd}`);
+        const s3Badge = j.minioKey ? ' · ☁️ S3 OK' : '';
+        lines.push(`${icon} <b>${escHtml(j.title.slice(0, 38))}</b> [${j.status}] ${j.progressPct}%${spd}${s3Badge}`);
         if (j.status === 'failed' && j.errorMessage) {
           lines.push(`   <i>↳ ${escHtml(j.errorMessage.slice(0, 110))}</i>`);
         }
@@ -1392,41 +1462,12 @@ export class TelegramBotRuntime {
       ]);
       rows.push([{ text: '🧹 Purgar Scratch', callback_data: 'cl:purge' }]);
     }
-    rows.push([{ text: '🏠 Menú Principal', callback_data: 'm:home' }]);
+    rows.push([{ text: '⚡ Ver Cuota y Pool', callback_data: 'lg:cuota' }, { text: '🏠 Menú Principal', callback_data: 'm:home' }]);
     await this.showOrEdit(chatId, editMessageId, lines.join('\n'), { inline_keyboard: rows });
   }
 
   private async renderAccountView(chatId: number, userId: string, editMessageId?: number): Promise<void> {
-    const isMaster = stateStore.isMasterAdmin(userId);
-    const session = stateStore.userSessions.find((s) => s.telegramUserId === userId);
-    const lines = [`<b>🔑 Cuenta de Picta (Multiusuario Aislado)</b>`, ``];
-    const rows: InlineKeyboardButton[][] = [];
-
-    if (session) {
-      lines.push(`👤 <b>Usuario vinculado:</b> ${escHtml(session.pictaUsername)}`);
-      lines.push(`📺 <b>Canal activo:</b> ${escHtml(session.channelName)} (#${escHtml(session.channelId)})`);
-      lines.push(`🔐 Credenciales protegidas con cifrado AES-256-GCM.`);
-      if (session.availableChannels.length > 1) {
-        lines.push(``, `Selecciona tu canal activo:`);
-        for (const ch of session.availableChannels.slice(0, 6)) {
-          const activeMark = String(ch.id) === String(session.channelId) ? '✅ ' : '';
-          rows.push([{ text: `${activeMark}${ch.nombre} (#${ch.id})`, callback_data: `ch:${ch.id}` }]);
-        }
-      }
-      rows.push([{ text: '🔄 Re-vincular (/login)', callback_data: 'ac:login' }, { text: '🚪 Cerrar sesión', callback_data: 'ac:logout' }]);
-    } else if (isMaster) {
-      lines.push(`👑 Operando con la <b>Cuenta Maestra</b> del servidor.`);
-      lines.push(`📺 Canal maestro: ${escHtml(pictaService.getDefaultChannelName())} (#${escHtml(pictaService.getDefaultChannelId())})`);
-      lines.push(`También puedes vincular una cuenta adicional con /login.`);
-      rows.push([{ text: '🔑 Vincular otra cuenta (/login)', callback_data: 'ac:login' }]);
-    } else {
-      lines.push(`No tienes ninguna cuenta de Picta vinculada todavía.`);
-      lines.push(`Tu cuenta operará totalmente aislada sobre tus propios canales sin acceso al canal maestro.`);
-      rows.push([{ text: '🔑 Iniciar sesión en Picta', callback_data: 'ac:login' }]);
-    }
-
-    rows.push([{ text: '📺 Ver Mi Canal', callback_data: 'm:chan' }, { text: '🏠 Menú', callback_data: 'm:home' }]);
-    await this.showOrEdit(chatId, editMessageId, lines.join('\n'), { inline_keyboard: rows });
+    await renderLiveAccountDiagnosticsView(chatId, userId, editMessageId);
   }
 
   private async renderAdminView(chatId: number, editMessageId?: number): Promise<void> {
@@ -1624,6 +1665,13 @@ export class TelegramBotRuntime {
       // Surfaces cleanly in worker
     }
 
+    const pinned = stateStore.getPinnedSerieForUser(user.telegramUserId);
+    if (pinned && draft.serieId === pinned.serieId) {
+      const epNum = Number(draft.numero || pinned.nextEpisodeNumber || 1);
+      pinned.nextEpisodeNumber = epNum + 1;
+      stateStore.setPinnedSerieForUser(pinned, user.telegramUserId);
+    }
+
     const now = new Date().toISOString();
     const job: TransferJob = {
       id: crypto.randomUUID(),
@@ -1654,11 +1702,15 @@ export class TelegramBotRuntime {
       autoPromo: draft.autoPromo,
       serieId: draft.serieId,
       temporada: draft.temporada,
+      temporadaId: draft.temporadaId,
       numero: draft.numero,
       playlistId: draft.playlistId,
       coverUrl: draft.coverUrl,
       posterUrl: draft.posterUrl,
       customCoverPath: draft.customCoverPath,
+      customPosterPath: draft.customPosterPath,
+      subtitlePath: draft.subtitlePath,
+      subtitleFileName: draft.subtitleFileName,
       telegramChatId: String(draft.chatId),
       telegramMessageId: draft.sourceMessageId,
       telegramFileId: draft.telegramFileId,
@@ -1707,7 +1759,8 @@ export class TelegramBotRuntime {
       .find(
         (j) =>
           j.status === 'queued' &&
-          ((j.source === 'telegram_mtproto' && j.telegramChatId && (j.telegramMessageId || j.telegramFileId)) ||
+          (Boolean(j.minioKey) ||
+            (j.source === 'telegram_mtproto' && j.telegramChatId && (j.telegramMessageId || j.telegramFileId)) ||
             (j.source === 'direct_url' && j.sourceUrl))
       );
     if (!job) return;
@@ -1720,93 +1773,105 @@ export class TelegramBotRuntime {
       const ctx = await pictaService.resolveContextForUser(job.userId);
       job.pictaChannel = ctx.channelName;
       job.pictaChannelId = ctx.channelId;
-      job.status = 'downloading';
-      job.progressPct = 5;
-      job.updatedAt = new Date().toISOString();
-      stateStore.saveJobs();
 
-      const relPath = job.scratchPath || `job_${job.id.slice(0, 8)}_${job.fileName.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
-      job.scratchPath = relPath;
-
-      const onDlProgress = (downloadedBytes: number, totalBytes: number, speedMbps?: number) => {
-        job.downloadedBytes = downloadedBytes;
-        if (speedMbps) job.speedMbps = speedMbps;
-        job.progressPct = Math.min(48, Math.max(5, Math.round((downloadedBytes / Math.max(1, totalBytes)) * 48)));
+      if (job.minioKey) {
+        // S3 Instant Reuse (/reintentar): video is already in Picta S3 MinIO!
+        job.status = 'creating_picta_publication';
+        job.progressPct = 90;
         job.updatedAt = new Date().toISOString();
-        const now = Date.now();
-        if (now - lastTgEditAt >= 3500) {
-          lastTgEditAt = now;
-          void this.updateJobStatusMessage(
-            job,
-            `⬇️ <b>Descargando</b> (${job.progressPct}% · ${job.speedMbps} MB/s)\n🎞️ ${escHtml(job.title)}\n📦 ${fmtMb(downloadedBytes)} / ${fmtMb(totalBytes)}`
-          );
-        }
-      };
-
-      if (job.source === 'direct_url' && job.sourceUrl) {
+        stateStore.saveJobs();
         await this.updateJobStatusMessage(
           job,
-          `🌐 <b>Descargando desde enlace directo...</b>\n🎞️ ${escHtml(job.title)}\n📺 Canal: ${escHtml(ctx.channelName)}`
+          `⚡ <b>Reutilizando archivo ya subido en Picta S3...</b>\n🎞️ ${escHtml(job.title)}\n☁️ Key: <code>${escHtml(job.minioKey)}</code>`
         );
-        const maxBytes = Math.round(stateStore.quotaSettings.maxSingleFileGb * 1024 ** 3);
-        const dl = await downloadDirectUrlToScratch({
-          url: job.sourceUrl,
-          targetRelativePath: relPath,
-          maxBytes,
-          onProgress: onDlProgress,
-        });
-        downloadedPath = dl.filePath;
-        job.downloadedBytes = dl.bytesWritten;
-        job.sizeBytes = dl.bytesWritten;
-        if (dl.detectedFileName && job.fileName === 'video_url.mp4') job.fileName = dl.detectedFileName;
       } else {
-        await this.updateJobStatusMessage(
-          job,
-          `⬇️ <b>Descargando video de Telegram...</b>\n🎞️ ${escHtml(job.title)}\n📦 ${fmtMb(job.sizeBytes)} · Canal: ${escHtml(ctx.channelName)}`
-        );
+        job.status = 'downloading';
+        job.progressPct = 5;
+        job.updatedAt = new Date().toISOString();
+        stateStore.saveJobs();
 
-        let dl: { filePath: string; bytesWritten: number; throughputMbps: number } | null = null;
-        // Prefer MTProto for >19.5MB or when connected; automatically fall back to Bot API for <=19.5MB!
-        if (mtprotoPool.isConfigured() && job.telegramMessageId && job.telegramChatId) {
-          try {
-            dl = await mtprotoPool.downloadTelegramMessageMedia({
-              chatId: job.telegramChatId,
-              messageId: job.telegramMessageId,
-              expectedBytes: job.sizeBytes,
-              targetRelativePath: relPath,
-              onProgress: onDlProgress,
-            });
-          } catch (mtErr) {
-            if (job.telegramFileId && job.sizeBytes > 0 && job.sizeBytes <= BOT_API_MAX_DOWNLOAD_BYTES) {
-              netlog.warn('telegram', `MTProto falló en archivo <=19.5MB; usando Bot API fallback: ${mtErr instanceof Error ? mtErr.message : String(mtErr)}`);
-            } else {
-              throw mtErr;
+        const relPath = job.scratchPath || `job_${job.id.slice(0, 8)}_${job.fileName.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+        job.scratchPath = relPath;
+
+        const onDlProgress = (downloadedBytes: number, totalBytes: number, speedMbps?: number) => {
+          job.downloadedBytes = downloadedBytes;
+          if (speedMbps) job.speedMbps = speedMbps;
+          job.progressPct = Math.min(48, Math.max(5, Math.round((downloadedBytes / Math.max(1, totalBytes)) * 48)));
+          job.updatedAt = new Date().toISOString();
+          const now = Date.now();
+          if (now - lastTgEditAt >= 3500) {
+            lastTgEditAt = now;
+            void this.updateJobStatusMessage(
+              job,
+              `⬇️ <b>Descargando</b> (${job.progressPct}% · ${job.speedMbps} MB/s)\n🎞️ ${escHtml(job.title)}\n📦 ${fmtMb(downloadedBytes)} / ${fmtMb(totalBytes)}`
+            );
+          }
+        };
+
+        if (job.source === 'direct_url' && job.sourceUrl) {
+          await this.updateJobStatusMessage(
+            job,
+            `🌐 <b>Descargando desde enlace directo...</b>\n🎞️ ${escHtml(job.title)}\n📺 Canal: ${escHtml(ctx.channelName)}`
+          );
+          const maxBytes = Math.round(stateStore.quotaSettings.maxSingleFileGb * 1024 ** 3);
+          const dl = await downloadDirectUrlToScratch({
+            url: job.sourceUrl,
+            targetRelativePath: relPath,
+            maxBytes,
+            onProgress: onDlProgress,
+          });
+          downloadedPath = dl.filePath;
+          job.downloadedBytes = dl.bytesWritten;
+          job.sizeBytes = dl.bytesWritten;
+          if (dl.detectedFileName && job.fileName === 'video_url.mp4') job.fileName = dl.detectedFileName;
+        } else {
+          await this.updateJobStatusMessage(
+            job,
+            `⬇️ <b>Descargando video de Telegram...</b>\n🎞️ ${escHtml(job.title)}\n📦 ${fmtMb(job.sizeBytes)} · Canal: ${escHtml(ctx.channelName)}`
+          );
+
+          let dl: { filePath: string; bytesWritten: number; throughputMbps: number } | null = null;
+          if (mtprotoPool.isConfigured() && job.telegramMessageId && job.telegramChatId) {
+            try {
+              dl = await mtprotoPool.downloadTelegramMessageMedia({
+                chatId: job.telegramChatId,
+                messageId: job.telegramMessageId,
+                expectedBytes: job.sizeBytes,
+                targetRelativePath: relPath,
+                onProgress: onDlProgress,
+              });
+            } catch (mtErr) {
+              if (job.telegramFileId && job.sizeBytes > 0 && job.sizeBytes <= BOT_API_MAX_DOWNLOAD_BYTES) {
+                netlog.warn('telegram', `MTProto falló en archivo <=19.5MB; usando Bot API fallback: ${mtErr instanceof Error ? mtErr.message : String(mtErr)}`);
+              } else {
+                throw mtErr;
+              }
             }
           }
+          if (!dl && job.telegramFileId && job.sizeBytes <= BOT_API_MAX_DOWNLOAD_BYTES) {
+            dl = await tgDownloadBotFileToScratch(job.telegramFileId, relPath, BOT_API_MAX_DOWNLOAD_BYTES, onDlProgress);
+          }
+          if (!dl) {
+            throw new Error(
+              job.sizeBytes > BOT_API_MAX_DOWNLOAD_BYTES
+                ? 'Archivo > 20 MB requiere MTProto FastSocket activo (verifica TELEGRAM_API_ID y TELEGRAM_API_HASH).'
+                : 'No se pudo descargar el archivo desde Telegram.'
+            );
+          }
+          downloadedPath = dl.filePath;
+          job.downloadedBytes = dl.bytesWritten;
         }
-        if (!dl && job.telegramFileId && job.sizeBytes <= BOT_API_MAX_DOWNLOAD_BYTES) {
-          dl = await tgDownloadBotFileToScratch(job.telegramFileId, relPath, BOT_API_MAX_DOWNLOAD_BYTES, onDlProgress);
-        }
-        if (!dl) {
-          throw new Error(
-            job.sizeBytes > BOT_API_MAX_DOWNLOAD_BYTES
-              ? 'Archivo > 20 MB requiere MTProto FastSocket activo (verifica TELEGRAM_API_ID y TELEGRAM_API_HASH).'
-              : 'No se pudo descargar el archivo desde Telegram.'
-          );
-        }
-        downloadedPath = dl.filePath;
-        job.downloadedBytes = dl.bytesWritten;
+
+        job.status = 'uploading';
+        job.progressPct = 50;
+        job.updatedAt = new Date().toISOString();
+        stateStore.saveJobs();
+
+        await this.updateJobStatusMessage(
+          job,
+          `⬆️ <b>Subiendo a Picta S3 MinIO...</b>\n🎞️ ${escHtml(job.title)}\n📺 Canal: ${escHtml(ctx.channelName)}`
+        );
       }
-
-      job.status = 'uploading';
-      job.progressPct = 50;
-      job.updatedAt = new Date().toISOString();
-      stateStore.saveJobs();
-
-      await this.updateJobStatusMessage(
-        job,
-        `⬆️ <b>Subiendo a Picta S3 MinIO...</b>\n🎞️ ${escHtml(job.title)}\n📺 Canal: ${escHtml(ctx.channelName)}`
-      );
 
       const uploadRes = await pictaService.uploadVideoToPictaPipeline({
         ctx,
@@ -1823,11 +1888,21 @@ export class TelegramBotRuntime {
         mostrarComentarios: job.mostrarComentarios,
         serieId: job.serieId,
         temporada: job.temporada,
+        temporadaId: job.temporadaId,
         numero: job.numero,
         playlistId: job.playlistId,
         coverUrl: job.coverUrl,
         posterUrl: job.posterUrl,
         customCoverPath: job.customCoverPath,
+        customPosterPath: job.customPosterPath,
+        subtitlePath: job.subtitlePath,
+        subtitleFileName: job.subtitleFileName,
+        existingMinioKey: job.minioKey,
+        onMinioUploaded: (key) => {
+          job.minioKey = key;
+          job.status = 'creating_picta_publication';
+          stateStore.saveJobs();
+        },
         onUploadProgress: (uploadedBytes, totalBytes, speedMbps) => {
           job.uploadedBytes = uploadedBytes;
           job.speedMbps = speedMbps;
@@ -1852,8 +1927,24 @@ export class TelegramBotRuntime {
       job.updatedAt = new Date().toISOString();
       stateStore.saveJobs();
 
-      this.safeRm(downloadedPath);
+      if (downloadedPath) this.safeRm(downloadedPath);
       if (job.customCoverPath) this.safeRm(job.customCoverPath);
+      if (job.customPosterPath) this.safeRm(job.customPosterPath);
+      if (job.subtitlePath) this.safeRm(job.subtitlePath);
+
+      // Auto-fulfill any matching viewer requests in /pedidos
+      const normUploaded = job.title.toLowerCase();
+      let fulfilledChanged = false;
+      for (const req of stateStore.channelRequests) {
+        if (req.status === 'pending') {
+          const reqNorm = req.requestedTitle.toLowerCase().trim();
+          if (reqNorm.length >= 3 && (normUploaded.includes(reqNorm) || reqNorm.includes(normUploaded))) {
+            req.status = 'fulfilled';
+            fulfilledChanged = true;
+          }
+        }
+      }
+      if (fulfilledChanged) stateStore.saveChannelRequests();
 
       let promoNote = '';
       if (job.autoPromo && stateStore.promoChannels.some((p) => p.autoPostEnabled)) {
@@ -1898,8 +1989,9 @@ export class TelegramBotRuntime {
       if (downloadedPath) this.safeRm(downloadedPath);
       if (job.customCoverPath) this.safeRm(job.customCoverPath);
       netlog.error('picta', `Fallo transferencia "${job.title}": ${msg}`);
-      await this.updateJobStatusMessage(job, `❌ <b>Error procesando "${escHtml(job.title)}"</b>\n${escHtml(msg)}`, {
-        inline_keyboard: [[{ text: '🔁 Reintentar fallidos', callback_data: 'cl:retry' }, { text: '📥 Ver Cola', callback_data: 'm:col' }]],
+      const s3Note = job.minioKey ? `\n☁️ <i>El archivo ya quedó en S3 (<code>${escHtml(job.minioKey)}</code>); al tocar Reintentar se registrará en 1s sin re-subir.</i>` : '';
+      await this.updateJobStatusMessage(job, `❌ <b>Error procesando "${escHtml(job.title)}"</b>\n${escHtml(msg)}${s3Note}`, {
+        inline_keyboard: [[{ text: '🔁 Reintentar fallidos (/reintentar)', callback_data: 'cl:retry' }, { text: '📋 Ver Cola', callback_data: 'm:col' }]],
       });
     } finally {
       this.queueWorkerBusy = false;
@@ -1977,11 +2069,16 @@ export class TelegramBotRuntime {
         mostrarComentarios: job.mostrarComentarios,
         serieId: job.serieId,
         temporada: job.temporada,
+        temporadaId: job.temporadaId,
         numero: job.numero,
         playlistId: job.playlistId,
         coverUrl: job.coverUrl,
         posterUrl: job.posterUrl,
         customCoverPath: job.customCoverPath,
+        onMinioUploaded: (key) => {
+          job.minioKey = key;
+          stateStore.saveJobs();
+        },
         onUploadProgress: (uploadedBytes, totalBytes, speedMbps) => {
           job.uploadedBytes = uploadedBytes;
           job.speedMbps = speedMbps;
@@ -2052,7 +2149,7 @@ export class TelegramBotRuntime {
   }
 
   // ===========================================================================
-  // DUAL-MODE UPLOAD ENTRY (WIZARD vs FAST)
+  // DUAL-MODE UPLOAD ENTRY (WIZARD vs FAST + MODO SERIE FIJA + DUPLICATE CHECK)
   // ===========================================================================
 
   private async startUploadFlow(params: {
@@ -2070,6 +2167,19 @@ export class TelegramBotRuntime {
     const analyzed = analyzeVideoTitleAndSynopsis(params.fileName, params.caption);
     const yearMatch = `${params.fileName} ${params.caption || ''}`.match(/\b(19\d\d|20\d\d)\b/);
     const draftId = crypto.randomBytes(4).toString('hex');
+    const pinnedSerie = stateStore.getPinnedSerieForUser(params.user.telegramUserId);
+
+    const epNumStr = pinnedSerie
+      ? analyzed.seriesInfo.hasExplicitNumbers
+        ? analyzed.seriesInfo.numero
+        : String(pinnedSerie.nextEpisodeNumber || 1)
+      : analyzed.seriesInfo.numero;
+    const seasonStr = pinnedSerie ? String(pinnedSerie.seasonNum) : analyzed.seriesInfo.temporada;
+
+    const initialTitle = pinnedSerie
+      ? buildSerieTitleOptions(pinnedSerie.serieName, seasonStr, epNumStr, analyzed.seriesInfo.episodeSubtitle)[0]
+      : analyzed.initialTitle;
+
     const draft: UploadWizardDraft = {
       id: draftId,
       userId: params.user.telegramUserId,
@@ -2081,9 +2191,9 @@ export class TelegramBotRuntime {
       unirPartPaths: params.unirPartPaths,
       fileName: params.fileName,
       sizeBytes: params.sizeBytes,
-      title: analyzed.initialTitle,
-      description: analyzed.initialSynopsis,
-      tipologia: analyzed.suggestedTipologia,
+      title: initialTitle,
+      description: analyzed.initialSynopsis || (pinnedSerie ? `${pinnedSerie.serieName} — Temporada ${seasonStr}, Capítulo ${epNumStr}` : ''),
+      tipologia: pinnedSerie ? 5 : analyzed.suggestedTipologia,
       clasificacion: (process.env.PICTA_CLASIFICACION || '+16').trim(),
       keywords: '',
       year: yearMatch?.[1],
@@ -2091,21 +2201,62 @@ export class TelegramBotRuntime {
       descargable: true,
       mostrarComentarios: true,
       autoPromo: stateStore.promoChannels.some((p) => p.autoPostEnabled),
-      temporada: analyzed.seriesInfo.temporada,
-      numero: analyzed.seriesInfo.numero,
+      serieId: pinnedSerie?.serieId,
+      serieName: pinnedSerie?.serieName,
+      temporada: seasonStr,
+      temporadaId: pinnedSerie?.seasonId,
+      numero: epNumStr,
       episodeSubtitle: analyzed.seriesInfo.episodeSubtitle,
       tmdbCandidates: [],
       createdAt: Date.now(),
     };
 
-    if (params.user.uploadMode === 'fast') {
+    this.wizardDrafts.set(draftId, draft);
+
+    // Pre-upload duplicate detector (unless in pinned batch series mode)
+    if (!pinnedSerie && draft.title.length >= 4) {
+      try {
+        const hits = await pictaService.searchGlobalPictaCatalog(draft.title);
+        const dupHits = hits.filter((h) => h.kind === 'publicacion' && h.matchScore >= 0.82);
+        if (dupHits.length > 0) {
+          const lines = [
+            `<b>⚠️ POSIBLE CONTENIDO REPETIDO EN PICTA</b>`,
+            `Antes de subir <b>"${escHtml(draft.title)}"</b>, encontré ${dupHits.length} coincidencia(s) en Picta:`,
+            ``,
+            ...dupHits.slice(0, 4).map(
+              (h, i) =>
+                `${i + 1}. <a href="${escHtml(h.webUrl)}"><b>${escHtml(h.title)}</b></a>\n   📺 ${escHtml(h.channelName)} · 👁 ${fmtNum(h.views)} vistas${h.sizeBytes > 0 ? ` · 📦 ${fmtMb(h.sizeBytes)}` : ''}`
+            ),
+            ``,
+            `¿Deseas continuar con la subida o cancelar?`,
+          ];
+          const sentId = await tgSendMessage(params.chatId, lines.join('\n'), {
+            inline_keyboard: [
+              [{ text: '⚠️ Subir de Todas Formas', callback_data: `w:dupgo:${draft.id}` }],
+              [
+                { text: '✏️ Cambiar / Refinar Título', callback_data: `w:tit:${draft.id}` },
+                { text: '🛑 Cancelar Subida (Ya Existe)', callback_data: `w:can:${draft.id}` },
+              ],
+            ],
+          });
+          if (sentId) draft.messageId = sentId;
+          return;
+        }
+      } catch {
+        // Proceed if search fails
+      }
+    }
+
+    if (params.user.uploadMode === 'fast' || pinnedSerie) {
       const statusMsgId = await tgSendMessage(
         params.chatId,
-        `⚡ <b>Modo Rápido:</b> analizando metadatos para <i>${escHtml(draft.title)}</i>...`
+        pinnedSerie
+          ? `📌 <b>Modo Serie Fija:</b> encolando <i>${escHtml(draft.title)}</i>...`
+          : `⚡ <b>Modo Rápido:</b> analizando metadatos para <i>${escHtml(draft.title)}</i>...`
       );
       if (statusMsgId) draft.messageId = statusMsgId;
 
-      if (!analyzed.filenameIsRandom) {
+      if (!pinnedSerie && !analyzed.filenameIsRandom) {
         const tmdb = await searchTmdbRichCandidates(draft.title);
         if (tmdb.length > 0 && tmdb[0].score >= 70) {
           const best = tmdb[0];
@@ -2624,6 +2775,299 @@ export class TelegramBotRuntime {
       });
       stateStore.saveChannelRequests();
       await this.renderRequestsView(chatId, 0);
+      return true;
+    }
+
+    if (pending.kind === 'pool_user') {
+      if (!text) {
+        await tgSendMessage(chatId, 'Envía el usuario o teléfono de Picta para el Pool, o /cancelar.');
+        return true;
+      }
+      this.pendingInputs.set(userId, {
+        kind: 'pool_pass',
+        chatId,
+        username: text,
+        expiresAt: Date.now() + 5 * 60_000,
+      });
+      await tgSendMessage(
+        chatId,
+        `🔐 Ahora envía la <b>contraseña de Picta</b> para la cuenta del Pool <b>${escHtml(text)}</b>.\n<i>(Borraré tu mensaje al instante por seguridad)</i>`
+      );
+      return true;
+    }
+
+    if (pending.kind === 'pool_pass') {
+      void tgDeleteMessage(chatId, msg.message_id);
+      this.pendingInputs.delete(userId);
+      if (!text) return true;
+      const waitMsg = await tgSendMessage(chatId, '🔄 Verificando cuenta para el Pool Multi-Cuenta...');
+      try {
+        const acc = await addSecondaryAccountToPool(pending.username, text, userId);
+        const roleMsg = acc.canPublishDirectly
+          ? '👑 Cuenta con rol <b>Jefe de canal</b> (+10 publicaciones/día añadida)'
+          : '🚀 Cuenta añadida como <b>Acelerador S3 MinIO</b>';
+        await tgSendMessage(chatId, `✅ Cuenta <b>${escHtml(acc.username)}</b> agregada al Pool.\n${roleMsg}`);
+        await renderDailyQuotaAndPoolView(chatId, user, this.isAdmin(user), waitMsg || undefined);
+      } catch (err) {
+        await this.showOrEdit(
+          chatId,
+          waitMsg || undefined,
+          `❌ Error agregando cuenta al Pool: ${escHtml(err instanceof Error ? err.message : String(err))}`
+        );
+      }
+      return true;
+    }
+
+    if (pending.kind === 'cat_poster') {
+      const largestPhoto = msg.photo?.[msg.photo.length - 1];
+      if (!largestPhoto) {
+        await tgSendMessage(chatId, 'Envía una imagen vertical como foto para el póster, o escribe /cancelar.');
+        return true;
+      }
+      this.pendingInputs.delete(userId);
+      const saved = await tgDownloadSmallFileToScratch(largestPhoto.file_id, `catpos_${pending.videoId}_${Date.now()}.jpg`);
+      if (!saved) {
+        await tgSendMessage(chatId, '❌ No se pudo descargar el póster.');
+        return true;
+      }
+      try {
+        const ctx = await pictaService.resolveContextForUser(userId);
+        await pictaService.patchPublication(ctx, pending.videoId, { posterBuffer: fs.readFileSync(saved) });
+        await tgSendMessage(chatId, '✅ Póster secundario actualizado en Picta.');
+        await this.renderCatalogDetail(chatId, userId, pending.videoId);
+      } catch (err) {
+        await tgSendMessage(chatId, `❌ Error cambiando póster: ${escHtml(err instanceof Error ? err.message : String(err))}`);
+      } finally {
+        this.safeRm(saved);
+      }
+      return true;
+    }
+
+    if (pending.kind === 'cat_srt') {
+      const doc = msg.document;
+      if (!doc) {
+        await tgSendMessage(chatId, 'Envía el archivo de subtítulos <code>.srt</code> como documento, o escribe /cancelar.');
+        return true;
+      }
+      this.pendingInputs.delete(userId);
+      const saved = await tgDownloadSmallFileToScratch(doc.file_id, `sub_${pending.videoId}_${Date.now()}.srt`);
+      if (!saved) {
+        await tgSendMessage(chatId, '❌ No se pudo descargar el archivo .srt.');
+        return true;
+      }
+      try {
+        const ctx = await pictaService.resolveContextForUser(userId);
+        await pictaService.patchPublication(ctx, pending.videoId, {
+          subtitleBuffer: fs.readFileSync(saved),
+          subtitleFileName: doc.file_name || `sub_${pending.videoId}.srt`,
+        });
+        await tgSendMessage(chatId, '✅ Subtítulos (.srt) subidos a MinIO S3 y vinculados al video en Picta.');
+        await this.renderCatalogDetail(chatId, userId, pending.videoId);
+      } catch (err) {
+        await tgSendMessage(chatId, `❌ Error subiendo subtítulos: ${escHtml(err instanceof Error ? err.message : String(err))}`);
+      } finally {
+        this.safeRm(saved);
+      }
+      return true;
+    }
+
+    if (pending.kind === 'cat_epnum') {
+      this.pendingInputs.delete(userId);
+      if (!text) return true;
+      try {
+        const ctx = await pictaService.resolveContextForUser(userId);
+        const nums = text.match(/\d+/g);
+        if (!nums || nums.length === 0) {
+          await tgSendMessage(chatId, '❌ Formato inválido. Envía el número de capítulo o "Temporada Capítulo" (ej: 1 5).');
+          return true;
+        }
+        const fields =
+          nums.length >= 2
+            ? { tipologia: 5, temporada: String(Number(nums[0])), numero: String(Number(nums[1])) }
+            : { tipologia: 5, numero: String(Number(nums[0])) };
+        await pictaService.patchPublication(ctx, pending.videoId, fields);
+        await tgSendMessage(chatId, '✅ Número de capítulo/temporada actualizado en Picta.');
+        await this.renderCatalogDetail(chatId, userId, pending.videoId);
+      } catch (err) {
+        await tgSendMessage(chatId, `❌ ${escHtml(err instanceof Error ? err.message : String(err))}`);
+      }
+      return true;
+    }
+
+    if (pending.kind === 'cat_tags') {
+      this.pendingInputs.delete(userId);
+      if (!text) return true;
+      try {
+        const ctx = await pictaService.resolveContextForUser(userId);
+        const words = text
+          .split(',')
+          .map((w) => w.trim())
+          .filter(Boolean);
+        const ids: number[] = [];
+        for (const w of words.slice(0, 8)) {
+          const kw = await pictaService.searchOrCreateKeyword(ctx, w);
+          ids.push(kw.id);
+        }
+        await tgSendMessage(chatId, `✅ ${ids.length} etiqueta(s) registradas/verificadas en Picta.`);
+        await this.renderCatalogDetail(chatId, userId, pending.videoId);
+      } catch (err) {
+        await tgSendMessage(chatId, `❌ ${escHtml(err instanceof Error ? err.message : String(err))}`);
+      }
+      return true;
+    }
+
+    if (pending.kind === 'ser_poster') {
+      const largestPhoto = msg.photo?.[msg.photo.length - 1];
+      if (!largestPhoto) {
+        await tgSendMessage(chatId, 'Envía una foto vertical para el póster de la serie, o escribe /cancelar.');
+        return true;
+      }
+      this.pendingInputs.delete(userId);
+      const saved = await tgDownloadSmallFileToScratch(largestPhoto.file_id, `serpos_${pending.serieId}_${Date.now()}.jpg`);
+      if (!saved) {
+        await tgSendMessage(chatId, '❌ No se pudo descargar el póster.');
+        return true;
+      }
+      try {
+        const ctx = await pictaService.resolveContextForUser(userId);
+        await pictaService.patchSerie(ctx, pending.serieId, { posterBuffer: fs.readFileSync(saved) });
+        await tgSendMessage(chatId, '✅ Póster de la serie actualizado.');
+        await this.renderSerieDetailView(chatId, userId, pending.serieId);
+      } catch (err) {
+        await tgSendMessage(chatId, `❌ ${escHtml(err instanceof Error ? err.message : String(err))}`);
+      } finally {
+        this.safeRm(saved);
+      }
+      return true;
+    }
+
+    if (pending.kind === 'ch_alias') {
+      this.pendingInputs.delete(userId);
+      if (!text) return true;
+      try {
+        const ctx = await pictaService.resolveContextForUser(userId);
+        const cleanAlias = text.replace(/^@+/, '').trim().slice(0, 60);
+        await pictaService.patchChannel(ctx, { alias: cleanAlias });
+        await tgSendMessage(chatId, `✅ Alias del canal actualizado a <b>@${escHtml(cleanAlias)}</b>.`);
+        await this.renderChannelProfileView(chatId, userId);
+      } catch (err) {
+        await tgSendMessage(chatId, `❌ ${escHtml(err instanceof Error ? err.message : String(err))}`);
+      }
+      return true;
+    }
+
+    if (pending.kind === 'ch_switch') {
+      this.pendingInputs.delete(userId);
+      if (!text) return true;
+      try {
+        const ctx = await pictaService.resolveContextForUser(userId);
+        const foundList = await pictaService.findPictaChannelByQuery(ctx, text);
+        const found = foundList[0];
+        if (!found) {
+          await tgSendMessage(chatId, `❌ No se encontró ningún canal en Picta para "<b>${escHtml(text)}</b>".`);
+          return true;
+        }
+        const session = stateStore.userSessions.find((s) => s.telegramUserId === userId);
+        if (session) {
+          session.channelId = String(found.id);
+          session.channelName = found.nombre;
+          if (!session.availableChannels.some((c) => String(c.id) === String(found.id))) {
+            session.availableChannels.push({ id: found.id, nombre: found.nombre, alias: found.alias });
+          }
+          stateStore.saveUserSessions();
+        }
+        await tgSendMessage(chatId, `✅ Canal activo cambiado a: <b>${escHtml(found.nombre)}</b> (#${found.id})`);
+        await this.renderChannelProfileView(chatId, userId);
+      } catch (err) {
+        await tgSendMessage(chatId, `❌ ${escHtml(err instanceof Error ? err.message : String(err))}`);
+      }
+      return true;
+    }
+
+    if (pending.kind === 'picta_search') {
+      this.pendingInputs.delete(userId);
+      if (!text) return true;
+      await renderGlobalPictaSearchView(chatId, userId, text);
+      return true;
+    }
+
+    if (pending.kind === 'colab_add') {
+      this.pendingInputs.delete(userId);
+      if (!text) return true;
+      try {
+        const ctx = await pictaService.resolveContextForUser(userId);
+        const res = await pictaService.updateChannelCollaborator(ctx, text, 'add');
+        await tgSendMessage(
+          chatId,
+          `✅ Colaborador añadido: <b>${escHtml(res.resolvedLabel || `Usuario #${res.targetUserId}`)}</b>.`
+        );
+        await renderCollaboratorsView(chatId, userId);
+      } catch (err) {
+        await tgSendMessage(chatId, `❌ ${escHtml(err instanceof Error ? err.message : String(err))}`);
+      }
+      return true;
+    }
+
+    if (pending.kind === 'pers_add') {
+      this.pendingInputs.delete(userId);
+      if (!text) return true;
+      try {
+        const ctx = await pictaService.resolveContextForUser(userId);
+        const p = await pictaService.searchOrCreatePersona(ctx, text);
+        const msgHtml = `✅ Persona ${p.created ? 'registrada' : 'encontrada'} en Picta: <b>${escHtml(p.nombre)}</b> (ID: <code>${p.id}</code>)`;
+        await renderPersonasAndTagsView(chatId, msgHtml);
+      } catch (err) {
+        await tgSendMessage(chatId, `❌ ${escHtml(err instanceof Error ? err.message : String(err))}`);
+      }
+      return true;
+    }
+
+    if (pending.kind === 'tag_add') {
+      this.pendingInputs.delete(userId);
+      if (!text) return true;
+      try {
+        const ctx = await pictaService.resolveContextForUser(userId);
+        const kw = await pictaService.searchOrCreateKeyword(ctx, text);
+        const msgHtml = `✅ Etiqueta ${kw.created ? 'creada' : 'encontrada'} en Picta: <b>#${escHtml(kw.palabra)}</b> (ID: <code>${kw.id}</code>)`;
+        await renderPersonasAndTagsView(chatId, msgHtml);
+      } catch (err) {
+        await tgSendMessage(chatId, `❌ ${escHtml(err instanceof Error ? err.message : String(err))}`);
+      }
+      return true;
+    }
+
+    if (pending.kind === 'al_thresh') {
+      this.pendingInputs.delete(userId);
+      if (!text) return true;
+      const nums = (text.match(/\d+/g) || [])
+        .map((n) => Number(n))
+        .filter((n) => Number.isFinite(n) && n > 0)
+        .sort((a, b) => a - b);
+      if (nums.length === 0) {
+        await tgSendMessage(chatId, '❌ Envía números separados por espacio o coma (ej: 5 10 25 50 100 250 500 1000).');
+        return true;
+      }
+      const prefs = stateStore.getAlertPrefsForUser(userId);
+      prefs.thresholds = Array.from(new Set(nums)).slice(0, 20);
+      stateStore.saveAlertPreferences();
+      await tgSendMessage(chatId, '✅ Escala de metas progresivas actualizada.');
+      await renderLogrosAndAlertsHud(chatId, user);
+      return true;
+    }
+
+    if (pending.kind === 'cped_grp') {
+      this.pendingInputs.delete(userId);
+      if (!text) return true;
+      const parts = text.split(/\s+/);
+      const grpId = parts[0];
+      const grpTitle = parts.slice(1).join(' ').trim() || grpId;
+      const cfg = stateStore.getRequestsGroupConfigForUser(userId);
+      cfg.requestsGroupChatId = grpId;
+      cfg.requestsGroupLabel = grpTitle;
+      if (cfg.requestsMonitorMode === 'off') cfg.requestsMonitorMode = 'prefix';
+      stateStore.saveRequestsGroupConfigs();
+      await tgSendMessage(chatId, `✅ Grupo de Pedidos vinculado: <b>${escHtml(grpTitle)}</b> (<code>${escHtml(grpId)}</code>).`);
+      await renderCanalPedidosView(chatId, userId);
       return true;
     }
 
@@ -3188,6 +3632,35 @@ export class TelegramBotRuntime {
           );
           return;
         }
+        if (action === 'pos') {
+          await tgAnswerCallback(cq.id);
+          this.pendingInputs.set(userId, { kind: 'cat_poster', videoId: vid, chatId, expiresAt: Date.now() + 5 * 60_000 });
+          await tgSendMessage(chatId, '🖼️ Envía la foto vertical para el póster (imagen_secundaria) de la publicación (o /cancelar):');
+          return;
+        }
+        if (action === 'srt') {
+          await tgAnswerCallback(cq.id);
+          this.pendingInputs.set(userId, { kind: 'cat_srt', videoId: vid, chatId, expiresAt: Date.now() + 5 * 60_000 });
+          await tgSendMessage(chatId, '💬 Envía el archivo de subtítulos <code>.srt</code> como documento (o /cancelar):');
+          return;
+        }
+        if (action === 'epn') {
+          await tgAnswerCallback(cq.id);
+          this.pendingInputs.set(userId, { kind: 'cat_epnum', videoId: vid, chatId, expiresAt: Date.now() + 5 * 60_000 });
+          await tgSendMessage(chatId, '🔢 Escribe Temporada y Capítulo (ej: <code>1 5</code> para T1 Cap. 5) o /cancelar:');
+          return;
+        }
+        if (action === 'tag') {
+          await tgAnswerCallback(cq.id);
+          this.pendingInputs.set(userId, { kind: 'cat_tags', videoId: vid, chatId, expiresAt: Date.now() + 5 * 60_000 });
+          await tgSendMessage(chatId, '🏷️ Escribe las etiquetas separadas por coma (ej: <code>Estreno, Acción, HD</code>) o /cancelar:');
+          return;
+        }
+        if (action === 'bdoor') {
+          await tgAnswerCallback(cq.id, '🚪 Obteniendo enlaces directos...');
+          await renderDirectDownloadBackdoorView(chatId, userId, vid, msgId);
+          return;
+        }
         if (action === 'delok') {
           await tgAnswerCallback(cq.id, 'Eliminando...');
           const ctx = await pictaService.resolveContextForUser(userId);
@@ -3199,27 +3672,59 @@ export class TelegramBotRuntime {
         }
       }
 
-      // Channel Profile Editing
+      // Channel Profile Editing (Estudio de Canal)
       if (prefix === 'chp') {
-        await tgAnswerCallback(cq.id);
         const sub = parts[1];
         if (sub === 'name') {
+          await tgAnswerCallback(cq.id);
           this.pendingInputs.set(userId, { kind: 'ch_name', chatId, expiresAt: Date.now() + 5 * 60_000 });
           await tgSendMessage(chatId, '✏️ Escribe el nuevo nombre para tu canal de Picta (o /cancelar):');
+        } else if (sub === 'alias') {
+          await tgAnswerCallback(cq.id);
+          this.pendingInputs.set(userId, { kind: 'ch_alias', chatId, expiresAt: Date.now() + 5 * 60_000 });
+          await tgSendMessage(chatId, '🔖 Escribe el nuevo alias/slug para tu canal de Picta (o /cancelar):');
         } else if (sub === 'desc') {
+          await tgAnswerCallback(cq.id);
           this.pendingInputs.set(userId, { kind: 'ch_desc', chatId, expiresAt: Date.now() + 5 * 60_000 });
           await tgSendMessage(chatId, '📝 Escribe la nueva descripción de tu canal (o /cancelar):');
         } else if (sub === 'ava') {
+          await tgAnswerCallback(cq.id);
           this.pendingInputs.set(userId, { kind: 'ch_avatar', chatId, expiresAt: Date.now() + 5 * 60_000 });
           await tgSendMessage(chatId, '🖼️ Envía la foto para el nuevo avatar del canal (o /cancelar):');
         } else if (sub === 'ban') {
+          await tgAnswerCallback(cq.id);
           this.pendingInputs.set(userId, { kind: 'ch_banner', chatId, expiresAt: Date.now() + 5 * 60_000 });
           await tgSendMessage(chatId, '🎨 Envía la foto para el nuevo banner del canal (o /cancelar):');
+        } else if (sub === 'cla') {
+          await tgAnswerCallback(cq.id);
+          await this.showOrEdit(chatId, msgId, '<b>🔞 Selecciona la clasificación de edad del canal:</b>', {
+            inline_keyboard: [
+              CLASIFICACIONES.map((cl) => ({ text: cl, callback_data: `chp:sc:${cl}` })),
+              [{ text: '⬅️ Volver al Canal', callback_data: 'm:chp' }],
+            ],
+          });
+        } else if (sub === 'sc') {
+          const newCla = parts[2] || '+16';
+          await tgAnswerCallback(cq.id, `Clasificación: ${newCla}`);
+          const ctx = await pictaService.resolveContextForUser(userId);
+          await pictaService.patchChannel(ctx, { clasificacion: newCla });
+          await this.renderChannelProfileView(chatId, userId, msgId);
+        } else if (sub === 'pub' || sub === 'don') {
+          await tgAnswerCallback(cq.id, 'Actualizando canal...');
+          const ctx = await pictaService.resolveContextForUser(userId);
+          const prof = await pictaService.fetchChannelDetails(ctx);
+          if (prof) {
+            await pictaService.patchChannel(
+              ctx,
+              sub === 'pub' ? { publicado: !(prof.publicado !== false) } : { donacion: !prof.donacion }
+            );
+          }
+          await this.renderChannelProfileView(chatId, userId, msgId);
         }
         return;
       }
 
-      // Series CRUD
+      // Series CRUD & Modo Serie Fija
       if (data === 'm:ser') {
         await tgAnswerCallback(cq.id);
         await this.renderSeriesView(chatId, userId, msgId);
@@ -3237,6 +3742,53 @@ export class TelegramBotRuntime {
           await tgAnswerCallback(cq.id);
           this.pendingInputs.set(userId, { kind: 'ser_new', chatId, expiresAt: Date.now() + 5 * 60_000 });
           await tgSendMessage(chatId, '📺 Escribe el nombre de la nueva serie (buscaré carátula y sinopsis TMDB automáticamente, o /cancelar):');
+          return;
+        }
+        if (sub === 'batch') {
+          const ctx = await pictaService.resolveContextForUser(userId);
+          const list = await pictaService.fetchChannelSeries(ctx);
+          const cur = list.find((s) => s.id === sid);
+          if (cur) {
+            const currentBatch = stateStore.getPinnedSerieForUser(userId);
+            if (currentBatch && currentBatch.serieId === sid) {
+              stateStore.setPinnedSerieForUser(null, userId);
+              await tgAnswerCallback(cq.id, '❌ Modo Serie Fija desactivado');
+            } else {
+              stateStore.setPinnedSerieForUser(
+                {
+                  userId,
+                  serieId: cur.id,
+                  serieName: cur.nombre,
+                  seasonNum: 1,
+                  nextEpisodeNumber: Math.max(1, cur.cantidad_capitulos + 1),
+                },
+                userId
+              );
+              await tgAnswerCallback(cq.id, `📌 Modo Serie Fija activo: ${cur.nombre}`);
+            }
+          }
+          await this.renderSerieDetailView(chatId, userId, sid, msgId);
+          return;
+        }
+        if (sub === 'unpinbatch') {
+          stateStore.setPinnedSerieForUser(null, userId);
+          await tgAnswerCallback(cq.id, '❌ Modo Serie Fija desactivado');
+          await this.renderSeriesView(chatId, userId, msgId);
+          return;
+        }
+        if (sub === 'newsea') {
+          await tgAnswerCallback(cq.id, '➕ Creando temporada...');
+          const ctx = await pictaService.resolveContextForUser(userId);
+          const list = await pictaService.fetchChannelSeries(ctx);
+          const cur = list.find((s) => s.id === sid);
+          const nextNum = (cur?.seasons?.length || 1) + 1;
+          const season = await pictaService.createSerieSeason(ctx, sid, nextNum);
+          if (season) {
+            await tgSendMessage(chatId, `✅ Temporada ${season.numero} creada en <b>${escHtml(cur?.nombre || String(sid))}</b>.`);
+          } else {
+            await tgSendMessage(chatId, `⚠️ Picta registró Temporada ${nextNum}.`);
+          }
+          await this.renderSerieDetailView(chatId, userId, sid, msgId);
           return;
         }
         if (sub === 'pin') {
@@ -3266,6 +3818,12 @@ export class TelegramBotRuntime {
           await tgSendMessage(chatId, '🖼️ Envía la nueva foto de portada para esta serie (o /cancelar):');
           return;
         }
+        if (sub === 'pos') {
+          await tgAnswerCallback(cq.id);
+          this.pendingInputs.set(userId, { kind: 'ser_poster', serieId: sid, chatId, expiresAt: Date.now() + 5 * 60_000 });
+          await tgSendMessage(chatId, '🖼️ Envía la foto vertical para el póster (imagen_secundaria) de la serie (o /cancelar):');
+          return;
+        }
         if (sub === 'pub') {
           await tgAnswerCallback(cq.id, 'Actualizando...');
           const ctx = await pictaService.resolveContextForUser(userId);
@@ -3289,9 +3847,11 @@ export class TelegramBotRuntime {
           }
           const imgUrl = best.backdropUrl || best.posterUrl;
           const coverBuf = imgUrl ? (await fetchSafeImageBuffer(imgUrl)) || undefined : undefined;
+          const posterBuf = best.posterUrl ? (await fetchSafeImageBuffer(best.posterUrl)) || undefined : undefined;
           await pictaService.patchSerie(ctx, sid, {
             ...(best.overview ? { descripcion: best.overview.slice(0, 1000) } : {}),
             ...(coverBuf ? { coverBuffer: coverBuf } : {}),
+            ...(posterBuf ? { posterBuffer: posterBuf } : {}),
           });
           await this.renderSerieDetailView(chatId, userId, sid, msgId);
           return;
@@ -3545,7 +4105,9 @@ export class TelegramBotRuntime {
       // Viewer Requests & Denuncias
       if (prefix === 'm' && parts[1] === 'req') {
         await tgAnswerCallback(cq.id);
-        await this.renderRequestsView(chatId, Number(parts[2] || 0), msgId);
+        const page = Number(parts[2] || 0);
+        const tab = (parts[3] === 'done' || parts[3] === 'fulfilled' ? 'fulfilled' : 'pending') as 'pending' | 'fulfilled';
+        await this.renderRequestsView(chatId, page, msgId, tab);
         return;
       }
       if (prefix === 'rq') {
@@ -3568,6 +4130,11 @@ export class TelegramBotRuntime {
         if (sub === 'tm' && rec) {
           await tgAnswerCallback(cq.id, '🎬 Buscando en TMDB...');
           await this.handleTmdbLookupMessage(chatId, rec.requestedTitle);
+          return;
+        }
+        if (sub === 'chk' && rec) {
+          await tgAnswerCallback(cq.id, '🔎 Buscando en Picta...');
+          await renderGlobalPictaSearchView(chatId, userId, rec.requestedTitle, msgId);
           return;
         }
         if (rec) {
@@ -3629,13 +4196,13 @@ export class TelegramBotRuntime {
       if (data === 'cl:retry') {
         const failed = stateStore.jobs.filter((j) => j.status === 'failed');
         for (const j of failed) {
-          j.status = j.minioKey ? 'encoding_nomad' : 'queued';
+          j.status = 'queued';
           j.nomadRetries = 0;
           j.errorMessage = undefined;
           j.updatedAt = new Date().toISOString();
         }
         stateStore.saveJobs();
-        await tgAnswerCallback(cq.id, `🔁 ${failed.length} trabajo(s) reencolado(s)`);
+        await tgAnswerCallback(cq.id, `🔁 ${failed.length} trabajo(s) reencolado(s) (reuso S3 activo)`);
         void this.processNextQueuedJob();
         await this.renderQueueView(chatId, user, msgId);
         return;
@@ -3710,6 +4277,180 @@ export class TelegramBotRuntime {
         const r = await pictaService.runNomadEncoderRetrySweep((uid, txt) => this.sendMessage(uid, txt));
         await tgSendMessage(chatId, `🔁 Barrido Nomad: ${r.checked} revisados, ${r.advanced} actualizados.`);
         return;
+      }
+
+      // Legacy Exclusive Views (lg:*)
+      if (prefix === 'lg') {
+        const sub = parts[1];
+        if (sub === 'search') {
+          await tgAnswerCallback(cq.id);
+          await renderGlobalPictaSearchView(chatId, userId, undefined, msgId);
+          return;
+        }
+        if (sub === 'searchq') {
+          await tgAnswerCallback(cq.id);
+          this.pendingInputs.set(userId, { kind: 'picta_search', chatId, expiresAt: Date.now() + 5 * 60_000 });
+          await tgSendMessage(chatId, '🔎 Escribe el título a buscar en todo el catálogo global de Picta (o /cancelar):');
+          return;
+        }
+        if (sub === 'tmdbq') {
+          await tgAnswerCallback(cq.id);
+          this.pendingInputs.set(userId, { kind: 'tmdb_search', chatId, expiresAt: Date.now() + 5 * 60_000 });
+          await tgSendMessage(chatId, '🎬 Escribe el título de la película o serie a buscar en TMDB:');
+          return;
+        }
+        if (sub === 'audit' || sub === 'auditref') {
+          await tgAnswerCallback(cq.id, sub === 'auditref' ? '🔄 Escaneando canal...' : undefined);
+          const tab = (['dup', 'inc', 'unp', 'orp'].includes(parts[2] || '') ? parts[2] : 'dup') as 'dup' | 'inc' | 'unp' | 'orp';
+          const page = Number(parts[3] || 0);
+          await renderChannelAuditView(chatId, userId, tab, page, sub === 'auditref', msgId);
+          return;
+        }
+        if (sub === 'cuota') {
+          await tgAnswerCallback(cq.id);
+          await renderDailyQuotaAndPoolView(chatId, user, this.isAdmin(user), msgId);
+          return;
+        }
+        if (sub === 'qsplit') {
+          const steps = [3, 5, 7, 10];
+          const cur = stateStore.quotaSettings.maxSeriesPerDay;
+          stateStore.quotaSettings.maxSeriesPerDay = steps.find((s) => s > cur) ?? steps[0];
+          stateStore.saveQuotaSettings();
+          await tgAnswerCallback(cq.id, `Reserva Series: ${stateStore.quotaSettings.maxSeriesPerDay}/10`);
+          await renderDailyQuotaAndPoolView(chatId, user, this.isAdmin(user), msgId);
+          return;
+        }
+        if (sub === 'pooladd') {
+          await tgAnswerCallback(cq.id);
+          this.pendingInputs.set(userId, { kind: 'pool_user', chatId, expiresAt: Date.now() + 5 * 60_000 });
+          await tgSendMessage(chatId, '👤 Envía el usuario o teléfono de la cuenta secundaria de Picta para el Pool Multi-Cuenta (o /cancelar):');
+          return;
+        }
+        if (sub === 'pooldel') {
+          const accId = parts[2];
+          stateStore.quotaSettings.poolAccounts = stateStore.quotaSettings.poolAccounts.filter((a) => a.id !== accId);
+          stateStore.saveQuotaSettings();
+          await tgAnswerCallback(cq.id, '🗑️ Cuenta quitada del Pool');
+          await renderDailyQuotaAndPoolView(chatId, user, this.isAdmin(user), msgId);
+          return;
+        }
+        if (sub === 'qreset' && this.isAdmin(user)) {
+          stateStore.quotaSettings.seriesUploadedToday = 0;
+          stateStore.quotaSettings.otherUploadedToday = 0;
+          for (const acc of stateStore.quotaSettings.poolAccounts) acc.uploadedToday = 0;
+          stateStore.saveQuotaSettings();
+          await tgAnswerCallback(cq.id, '🔄 Contadores diarios Cuba reiniciados');
+          await renderDailyQuotaAndPoolView(chatId, user, this.isAdmin(user), msgId);
+          return;
+        }
+        if (sub === 'colab') {
+          await tgAnswerCallback(cq.id);
+          await renderCollaboratorsView(chatId, userId, msgId);
+          return;
+        }
+        if (sub === 'colabadd') {
+          await tgAnswerCallback(cq.id);
+          this.pendingInputs.set(userId, { kind: 'colab_add', chatId, expiresAt: Date.now() + 5 * 60_000 });
+          await tgSendMessage(chatId, '👥 Escribe el usuario o ID de Picta para añadir como colaborador del canal (o /cancelar):');
+          return;
+        }
+        if (sub === 'colabrem') {
+          await tgAnswerCallback(cq.id, 'Quitando colaborador...');
+          const ctx = await pictaService.resolveContextForUser(userId);
+          await pictaService.updateChannelCollaborator(ctx, parts[2] || '', 'remove');
+          await renderCollaboratorsView(chatId, userId, msgId);
+          return;
+        }
+        if (sub === 'pers') {
+          await tgAnswerCallback(cq.id);
+          await renderPersonasAndTagsView(chatId, undefined, msgId);
+          return;
+        }
+        if (sub === 'persadd') {
+          await tgAnswerCallback(cq.id);
+          this.pendingInputs.set(userId, { kind: 'pers_add', chatId, expiresAt: Date.now() + 5 * 60_000 });
+          await tgSendMessage(chatId, '🎭 Escribe el nombre del Actor, Director o Productor a buscar/crear en Picta (o /cancelar):');
+          return;
+        }
+        if (sub === 'tagadd') {
+          await tgAnswerCallback(cq.id);
+          this.pendingInputs.set(userId, { kind: 'tag_add', chatId, expiresAt: Date.now() + 5 * 60_000 });
+          await tgSendMessage(chatId, '🏷️ Escribe la palabra clave / etiqueta a buscar o crear en Picta (o /cancelar):');
+          return;
+        }
+        if (sub === 'logros') {
+          await tgAnswerCallback(cq.id);
+          await renderLogrosAndAlertsHud(chatId, user, msgId);
+          return;
+        }
+        if (sub === 'al') {
+          const action = parts[2];
+          const prefs = stateStore.getAlertPrefsForUser(userId);
+          if (action === 'c') prefs.enabledMetrics.comments = !prefs.enabledMetrics.comments;
+          else if (action === 'v') prefs.enabledMetrics.plays = !prefs.enabledMetrics.plays;
+          else if (action === 'l') prefs.enabledMetrics.likes = !prefs.enabledMetrics.likes;
+          else if (action === 'd') prefs.enabledMetrics.downloads = !prefs.enabledMetrics.downloads;
+          else if (action === 's' || action === 'm') prefs.milestonesEnabled = !prefs.milestonesEnabled;
+          else if (action === 'reset') prefs.thresholds = [...DEFAULT_MILESTONE_THRESHOLDS];
+          else if (action === 'th') {
+            await tgAnswerCallback(cq.id);
+            this.pendingInputs.set(userId, { kind: 'al_thresh', chatId, expiresAt: Date.now() + 5 * 60_000 });
+            await tgSendMessage(
+              chatId,
+              '🎚️ Escribe tus umbrales de hitos personalizados separados por coma o espacio (ej: <code>10, 50, 100, 500, 1000, 5000</code>):'
+            );
+            return;
+          }
+          stateStore.saveAlertPreferences();
+          await tgAnswerCallback(cq.id, 'Ajuste de alertas actualizado');
+          await renderLogrosAndAlertsHud(chatId, user, msgId);
+          return;
+        }
+        if (sub === 'cped') {
+          const action = parts[2];
+          const cfg = stateStore.getRequestsGroupConfigForUser(userId);
+          if (action === 'grp') {
+            await tgAnswerCallback(cq.id);
+            this.pendingInputs.set(userId, { kind: 'cped_grp', chatId, expiresAt: Date.now() + 5 * 60_000 });
+            await tgSendMessage(
+              chatId,
+              '💬 Envía el <code>@grupo</code> o ID (<code>-100...</code>) del grupo de pedidos donde el bot escuchará y verificará disponibilidad:'
+            );
+            return;
+          }
+          if (action === 'tog' || action === 'promo') {
+            cfg.requestsMonitorMode = cfg.requestsMonitorMode === 'off' ? 'prefix' : cfg.requestsMonitorMode === 'prefix' ? 'all' : 'off';
+            stateStore.saveRequestsGroupConfigs();
+          } else if (action === 'sendcard') {
+            await tgAnswerCallback(cq.id, '📣 Publicando tarjeta...');
+            const ctx = await pictaService.resolveContextForUser(userId);
+            const cardText = [
+              `🙋 <b>BUZÓN DE PEDIDOS — ${escHtml(ctx.channelName.toUpperCase())}</b>`,
+              ``,
+              `¿Qué película, serie o capítulo quieres que subamos a <b>Picta</b>?`,
+              `Escribe tu solicitud con <code>#pedido Nombre</code> o directamente en nuestro grupo.`,
+            ].join('\n');
+            let sent = 0;
+            for (const ch of stateStore.promoChannels) {
+              const id = await tgSendMessage(ch.telegramChatId, cardText);
+              if (id) sent += 1;
+            }
+            if (cfg.requestsGroupChatId) {
+              await tgSendMessage(cfg.requestsGroupChatId, cardText);
+            }
+            await tgSendMessage(chatId, `📣 Tarjeta de pedidos enviada a ${sent} canal(es) promo.`);
+            return;
+          }
+          await tgAnswerCallback(cq.id);
+          await renderCanalPedidosView(chatId, userId, msgId);
+          return;
+        }
+        if (sub === 'chswitch') {
+          await tgAnswerCallback(cq.id);
+          this.pendingInputs.set(userId, { kind: 'ch_switch', chatId, expiresAt: Date.now() + 5 * 60_000 });
+          await tgSendMessage(chatId, '🔄 Escribe el <b>Nombre</b>, <b>Slug</b> o <b>ID numérico</b> del canal de Picta al que deseas cambiar (o /cancelar):');
+          return;
+        }
       }
 
       // Account / Multi-user
@@ -3909,6 +4650,17 @@ export class TelegramBotRuntime {
           }
           await tgAnswerCallback(cq.id, 'Subida cancelada');
           await this.showOrEdit(chatId, msgId, '❌ Borrador de subida cancelado.');
+          return;
+        }
+        if (action === 'dupgo') {
+          draft.duplicateConfirmed = true;
+          await tgAnswerCallback(cq.id, '✅ Subida confirmada');
+          if (user.uploadMode === 'fast') {
+            this.wizardDrafts.delete(draftId);
+            await this.enqueueFromWizardDraft(draft, user);
+          } else {
+            await this.renderWizardCard(draft, msgId);
+          }
           return;
         }
         if (action === 'go') {
@@ -4206,6 +4958,43 @@ export class TelegramBotRuntime {
     const user = stateStore.users.find((u) => u.telegramUserId === userId && u.active);
     const text = (msg.text || msg.caption || '').trim();
 
+    // Monitored Group Requests Listener (/canalpedidos group auto-verifier)
+    const matchedGroupCfg = stateStore.requestsGroupConfigs.find(
+      (c) => c.requestsGroupChatId && (c.requestsGroupChatId === String(chatId) || (msg.chat.username && c.requestsGroupChatId.toLowerCase() === `@${msg.chat.username.toLowerCase()}`))
+    );
+    if (matchedGroupCfg && text) {
+      const reqMatch = text.match(/^(?:\/pedir(?:@\w+)?|#pedido|pedido:)\s+(.+)/i);
+      if (reqMatch && reqMatch[1]) {
+        const reqTitle = reqMatch[1].trim().slice(0, 120);
+        const author = msg.from.first_name || msg.from.username || userId;
+        if (matchedGroupCfg.requestsMonitorMode !== 'off') {
+          const ctx = await pictaService.resolveContextForUser(matchedGroupCfg.userId || userId);
+          const hits = await pictaService.searchGlobalPictaCatalog(reqTitle, ctx);
+          if (hits.length > 0) {
+            const top = hits[0];
+            await tgSendMessage(
+              chatId,
+              `✅ Hola <b>${escHtml(author)}</b>, encontramos en Picta:\n🎬 <b>${escHtml(top.title)}</b> (${escHtml(top.channelName)})\n🔗 ${escHtml(top.webUrl)}`
+            );
+            return;
+          }
+        }
+        stateStore.channelRequests.unshift({
+          id: crypto.randomUUID(),
+          requesterName: author,
+          requestedTitle: reqTitle,
+          rawText: text.slice(0, 300),
+          sourceVideoTitle: `Grupo Pedidos (${matchedGroupCfg.requestsGroupLabel})`,
+          commentId: msg.message_id,
+          createdAt: new Date().toISOString(),
+          status: 'pending',
+        });
+        stateStore.saveChannelRequests();
+        await tgSendMessage(chatId, `🙋 Pedido registrado: <b>${escHtml(reqTitle)}</b> (solicitado por ${escHtml(author)}).`);
+        return;
+      }
+    }
+
     if (!user) {
       await tgSendMessage(
         chatId,
@@ -4253,11 +5042,19 @@ export class TelegramBotRuntime {
       await this.renderTopVideosView(chatId, userId, 'v');
       return;
     }
-    if (text.startsWith('/canal')) {
+    if (text.startsWith('/canalpedidos') || text.startsWith('/promocion') || text.startsWith('/pedidoscanal')) {
+      await renderCanalPedidosView(chatId, userId);
+      return;
+    }
+    if (text.startsWith('/canales')) {
+      await this.renderAccountView(chatId, userId);
+      return;
+    }
+    if (text.startsWith('/canal') || text.startsWith('/micanal') || text.startsWith('/editarcanal')) {
       await this.renderChannelProfileView(chatId, userId);
       return;
     }
-    if (text.startsWith('/series')) {
+    if (text.startsWith('/series') || text.startsWith('/misseries') || text.startsWith('/rafaga') || text.startsWith('/fijar')) {
       await this.renderSeriesView(chatId, userId);
       return;
     }
@@ -4269,7 +5066,26 @@ export class TelegramBotRuntime {
       await this.renderCommentsView(chatId, userId, 'u', 0, true);
       return;
     }
-    if (text.startsWith('/peticiones')) {
+    if (text.startsWith('/pedir ')) {
+      const reqTitle = text.replace(/^\/pedir\s+/i, '').trim();
+      if (reqTitle) {
+        stateStore.channelRequests.unshift({
+          id: crypto.randomUUID(),
+          requesterName: user.displayName,
+          requestedTitle: reqTitle.slice(0, 120),
+          rawText: reqTitle,
+          sourceVideoTitle: 'Comando /pedir',
+          commentId: 0,
+          createdAt: new Date().toISOString(),
+          status: 'pending',
+        });
+        stateStore.saveChannelRequests();
+        await tgSendMessage(chatId, `🙋 Pedido añadido: <b>${escHtml(reqTitle)}</b>`);
+        await this.renderRequestsView(chatId, 0);
+        return;
+      }
+    }
+    if (text.startsWith('/pedidos') || text.startsWith('/peticiones') || text === '/pedir') {
       await this.renderRequestsView(chatId, 0);
       return;
     }
@@ -4279,6 +5095,18 @@ export class TelegramBotRuntime {
     }
     if (text.startsWith('/promos')) {
       await this.renderPromosView(chatId);
+      return;
+    }
+    if (text.startsWith('/auditoria') || text.startsWith('/saludcanal')) {
+      await renderChannelAuditView(chatId, userId, 'dup');
+      return;
+    }
+    if (text.startsWith('/colaboradores') || text.startsWith('/asociados')) {
+      await renderCollaboratorsView(chatId, userId);
+      return;
+    }
+    if (text.startsWith('/personas') || text.startsWith('/actores') || text.startsWith('/etiquetas') || text.startsWith('/tags')) {
+      await renderPersonasAndTagsView(chatId);
       return;
     }
     if (text.startsWith('/url')) {
@@ -4306,7 +5134,7 @@ export class TelegramBotRuntime {
       await tgSendMessage(chatId, '👤 Envía tu usuario o teléfono de Picta (8 dígitos o +53...), o /cancelar:');
       return;
     }
-    if (text.startsWith('/logout')) {
+    if (text.startsWith('/logout') || text.startsWith('/cerrarsesion')) {
       const idx = stateStore.userSessions.findIndex((s) => s.telegramUserId === userId);
       if (idx >= 0) {
         stateStore.userSessions.splice(idx, 1);
@@ -4318,7 +5146,7 @@ export class TelegramBotRuntime {
       await tgSendMessage(chatId, '🚪 Sesión personal de Picta eliminada.');
       return;
     }
-    if (text.startsWith('/mis_canales')) {
+    if (text.startsWith('/cuenta') || text.startsWith('/micuenta') || text.startsWith('/mis_canales')) {
       await this.renderAccountView(chatId, userId);
       return;
     }
@@ -4338,17 +5166,8 @@ export class TelegramBotRuntime {
       await this.renderGlobalConfigView(chatId);
       return;
     }
-    if (text.startsWith('/cuota')) {
-      await tgSendMessage(
-        chatId,
-        [
-          `<b>📊 Cuota de ${escHtml(user.displayName)}</b> (${user.role})`,
-          `• Consumo hoy: ${user.usedTodayGb.toFixed(2)} / ${user.dailyQuotaGb} GB`,
-          `• Archivos hoy: ${user.filesToday} / ${user.dailyMaxFiles}`,
-          `• Máximo por archivo: ${stateStore.quotaSettings.maxSingleFileGb} GB`,
-          `• Modo de subida: ${user.uploadMode === 'fast' ? '⚡ Rápido' : '🧭 Asistente'}`,
-        ].join('\n')
-      );
+    if (text.startsWith('/cuota') || text.startsWith('/limite') || text.startsWith('/pool') || text.startsWith('/cuentas')) {
+      await renderDailyQuotaAndPoolView(chatId, user, this.isAdmin(user));
       return;
     }
     if (text.startsWith('/disco')) {
@@ -4374,11 +5193,11 @@ export class TelegramBotRuntime {
       await tgSendMessage(chatId, `🧹 Purga completada: ${res.deletedCount} elemento(s) borrados (${fmtMb(res.freedBytes)} liberados).`);
       return;
     }
-    if (text.startsWith('/stats')) {
+    if (text.startsWith('/stats') || text.startsWith('/estadisticas') || text.startsWith('/dashboard') || text.startsWith('/picta')) {
       await this.renderStatsView(chatId, userId, 1);
       return;
     }
-    if (text.startsWith('/alertas')) {
+    if (text.startsWith('/alertas') || text.startsWith('/logros') || text.startsWith('/metas')) {
       await this.renderAlertsView(chatId, user);
       return;
     }
@@ -4387,30 +5206,25 @@ export class TelegramBotRuntime {
       await tgSendMessage(chatId, `🔁 Barrido Nomad: ${r.checked} revisados, ${r.advanced} actualizados.`);
       return;
     }
-    if (text.startsWith('/buscar')) {
-      const query = text.replace(/^\/buscar\s*/i, '').trim();
-      if (!query) {
-        this.pendingInputs.set(userId, { kind: 'tmdb_search', chatId, expiresAt: Date.now() + 5 * 60_000 });
-        await tgSendMessage(chatId, '🔍 Escribe el título de la película o serie a buscar en TMDB:');
-        return;
-      }
-      await this.handleTmdbLookupMessage(chatId, query);
+    if (text.startsWith('/buscar') || text.startsWith('/search')) {
+      const query = text.replace(/^\/(buscar|search)\s*/i, '').trim();
+      await renderGlobalPictaSearchView(chatId, userId, query || undefined);
       return;
     }
     if (text.startsWith('/cola')) {
       await this.renderQueueView(chatId, user);
       return;
     }
-    if (text.startsWith('/reintentar')) {
+    if (text.startsWith('/reintentar') || text.startsWith('/retry')) {
       const failed = stateStore.jobs.filter((j) => j.status === 'failed');
       for (const j of failed) {
-        j.status = j.minioKey ? 'encoding_nomad' : 'queued';
+        j.status = 'queued';
         j.nomadRetries = 0;
         j.errorMessage = undefined;
         j.updatedAt = new Date().toISOString();
       }
       stateStore.saveJobs();
-      await tgSendMessage(chatId, `🔁 Se reencolaron ${failed.length} trabajo(s) fallido(s).`);
+      await tgSendMessage(chatId, `🔁 Se reencolaron ${failed.length} trabajo(s) fallido(s) (reuso S3 instantáneo si ya estaba en MinIO).`);
       void this.processNextQueuedJob();
       return;
     }

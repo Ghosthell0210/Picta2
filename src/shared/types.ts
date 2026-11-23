@@ -7,7 +7,9 @@ export type TransferJobStatus =
   | 'downloading'
   | 'assembling'
   | 'uploading'
+  | 'creating_picta_publication'
   | 'encoding_nomad'
+  | 'awaiting_duplicate_confirmation'
   | 'completed'
   | 'failed'
   | 'cancelled';
@@ -46,11 +48,16 @@ export interface TransferJob {
   autoPromo?: boolean;
   serieId?: number;
   temporada?: string;
+  temporadaId?: number;
   numero?: string;
   playlistId?: number;
   coverUrl?: string;
   posterUrl?: string;
   customCoverPath?: string;
+  customPosterPath?: string;
+  subtitlePath?: string;
+  subtitleFileName?: string;
+  duplicateCheckApprovedTitle?: string;
   telegramChatId?: string;
   telegramMessageId?: number;
   telegramFileId?: string;
@@ -83,12 +90,60 @@ export interface AuthorizedUser {
   lastActiveAt: string;
 }
 
+export interface PictaPoolAccount {
+  id: string;
+  ownerUserId: string;
+  username: string;
+  displayName: string;
+  encryptedPassword: string;
+  canPublishDirectly: boolean;
+  uploadedToday: number;
+  exhaustedDate?: string;
+  addedAt: string;
+}
+
 export interface QuotaSettings {
   defaultDailyQuotaGb: number;
   defaultDailyMaxFiles: number;
   maxSingleFileGb: number;
   enforceQuotas: boolean;
   resetHourUtc: number;
+  currentDateCuba?: string;
+  maxSeriesPerDay?: number;
+  seriesUploadedToday?: number;
+  otherUploadedToday?: number;
+  poolAccounts?: PictaPoolAccount[];
+}
+
+export interface PinnedBatchSerie {
+  userId: string;
+  serieId: number;
+  serieName: string;
+  seasonNum: number;
+  seasonId?: number;
+  nextEpisodeNumber?: number;
+}
+
+export interface UserAlertPreferences {
+  userId: string;
+  commentsEnabled: boolean;
+  milestonesEnabled: boolean;
+  enabledMetrics: {
+    plays: boolean;
+    likes: boolean;
+    downloads: boolean;
+    comments: boolean;
+  };
+  thresholds: number[];
+}
+
+export interface UserRequestsGroupConfig {
+  userId: string;
+  targetChannelId?: string;
+  targetChannelLabel?: string;
+  requestsGroupChatId?: string;
+  requestsGroupLabel?: string;
+  requestsMonitorMode: 'off' | 'prefix' | 'all';
 }
 
 export interface OwnedPictaChannel {
@@ -106,6 +161,9 @@ export interface UserPictaSession {
   channelId: string;
   channelName: string;
   pictaUserId?: number;
+  userFullName?: string;
+  pictaGroups?: string[];
+  hasChannelAdminRole?: boolean;
   availableChannels: OwnedPictaChannel[];
   connectedAt: string;
   lastVerifiedAt: string;
@@ -135,6 +193,8 @@ export interface WatchedPictaVideo {
   ownerUserId: string;
   lastCommentCount: number;
   lastViewsCount: number;
+  lastLikesCount?: number;
+  lastDownloadsCount?: number;
   lastMilestoneNotified: number;
   nomadStatus: 'ready' | 'encoding' | 'failed';
   updatedAt: string;
@@ -149,10 +209,13 @@ export interface PictaChannelProfile {
   slug_url?: string;
   visible: boolean;
   publicado: boolean;
+  donacion?: boolean;
   cantidad_suscriptores: number;
   cantidad_publicaciones: number;
   url_avatar?: string;
   url_imagen?: string;
+  propietarioId?: number;
+  usuariosAsociados?: Array<{ id: number; label: string; isOwner: boolean }>;
 }
 
 export interface PictaCatalogItem {
@@ -165,17 +228,34 @@ export interface PictaCatalogItem {
   tipologiaNombre: string;
   clasificacion: string;
   cantidad_vistas: number;
+  cantidad_reproducciones?: number;
   cantidad_comentarios: number;
   cantidad_me_gusta: number;
   cantidad_descargas: number;
   publicado: boolean;
+  convertido?: boolean;
   descargable: boolean;
   estado_codificacion?: string;
+  motivo_rechazo?: string;
   url_imagen?: string;
   imagen_secundaria?: string;
+  url_subtitulo?: string;
   url_descarga?: string;
   url_manifiesto?: string;
+  tamanio?: number;
+  duracion?: number;
+  serieId?: number;
+  temporada?: number;
+  numero?: number;
+  palabras_clave?: string[];
   fecha_creacion?: string;
+  fecha_publicado?: string;
+}
+
+export interface PictaSerieSeason {
+  id: number;
+  numero: number;
+  nombre: string;
 }
 
 export interface PictaSerieItem {
@@ -188,6 +268,7 @@ export interface PictaSerieItem {
   imagen_secundaria?: string;
   publicado: boolean;
   pinned?: boolean;
+  seasons?: PictaSerieSeason[];
 }
 
 export interface PictaPlaylistItem {
@@ -209,6 +290,7 @@ export interface PictaCommentItem {
   fecha: string;
   publicacionId: number;
   publicacionNombre: string;
+  tipologiaId?: number;
   categoriaNombre: string;
   parentId?: number;
   replyCount: number;
@@ -234,10 +316,51 @@ export interface PictaDenunciaItem {
   fecha?: string;
 }
 
+export interface PictaGlobalSearchHit {
+  id: number;
+  kind: 'publicacion' | 'serie';
+  title: string;
+  categoryName: string;
+  tipologiaId: number;
+  channelId: string;
+  channelName: string;
+  sizeBytes: number;
+  resolutions: string[];
+  maxResolutionLabel: string;
+  durationSeconds: number;
+  views: number;
+  createdAt: string;
+  webUrl: string;
+  manifestUrl?: string;
+  downloadUrl?: string;
+  matchScore: number;
+  matchLevel: 'exact' | 'high' | 'partial';
+}
+
+export interface ChannelAuditItem {
+  id: string;
+  nombre: string;
+  reason: string;
+  publicado: boolean;
+  views: number;
+  createdAt?: string;
+}
+
+export interface ChannelAuditReport {
+  totalScanned: number;
+  duplicateGroups: Array<{ groupKey: string; reason: string; items: ChannelAuditItem[] }>;
+  incompleteItems: ChannelAuditItem[];
+  unpublishedItems: ChannelAuditItem[];
+  orphanEpisodeItems: ChannelAuditItem[];
+  generatedAt: string;
+}
+
 export interface ChannelRequestRecord {
   id: string;
+  ownerUserId?: string;
   commentId?: number;
   requesterName: string;
+  requesterUsername?: string;
   requestedTitle: string;
   rawText: string;
   sourceVideoTitle: string;

@@ -5,23 +5,49 @@ import type {
   AuthorizedUser,
   ChannelRequestRecord,
   PictaAlertEvent,
+  PinnedBatchSerie,
   PromoChannelRecord,
   QuotaSettings,
   RuntimeConfig,
   TelegramTransportMode,
   TransferJob,
+  UserAlertPreferences,
   UserPictaSession,
+  UserRequestsGroupConfig,
   VaultSnapshotRecord,
   WatchedPictaVideo,
 } from '../shared/types.ts';
 import { netlog } from './netlog.ts';
 
-const ACTIVE_STATUSES = new Set(['queued', 'downloading', 'assembling', 'uploading', 'encoding_nomad']);
+const ACTIVE_STATUSES = new Set([
+  'queued',
+  'downloading',
+  'assembling',
+  'uploading',
+  'creating_picta_publication',
+  'encoding_nomad',
+  'awaiting_duplicate_confirmation',
+]);
 const MAX_JOBS_HISTORY = 120;
 const MAX_ALERTS_HISTORY = 100;
 const MAX_REQUESTS_HISTORY = 200;
 const MAX_IGNORED_COMMENTS = 500;
 const MAX_VAULT_SNAPSHOTS = 25;
+
+export const DEFAULT_MILESTONE_THRESHOLDS = [100, 500, 1000, 5000, 10000, 25000, 50000, 100000];
+
+export function getCubaDateStr(date = new Date()): string {
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Havana',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(date);
+  } catch {
+    return date.toISOString().slice(0, 10);
+  }
+}
 
 function clampNumber(val: number, min: number, max: number, fallback: number): number {
   if (!Number.isFinite(val)) return fallback;
@@ -66,6 +92,9 @@ export interface PersistedStateBundle {
   watchedVideos: WatchedPictaVideo[];
   vaultSnapshots: VaultSnapshotRecord[];
   pinnedSeriesIds: number[];
+  pinnedBatchSeries?: PinnedBatchSerie[];
+  alertPreferences?: UserAlertPreferences[];
+  requestsGroupConfigs?: UserRequestsGroupConfig[];
   channelRequests: ChannelRequestRecord[];
   ignoredCommentIds: number[];
   promoChannels: PromoChannelRecord[];
@@ -84,6 +113,9 @@ export class StateStore {
   public watchedVideos: WatchedPictaVideo[] = [];
   public vaultSnapshots: VaultSnapshotRecord[] = [];
   public pinnedSeriesIds: number[] = [];
+  public pinnedBatchSeries: PinnedBatchSerie[] = [];
+  public alertPreferences: UserAlertPreferences[] = [];
+  public requestsGroupConfigs: UserRequestsGroupConfig[] = [];
   public channelRequests: ChannelRequestRecord[] = [];
   public ignoredCommentIds: number[] = [];
   public promoChannels: PromoChannelRecord[] = [];
@@ -118,10 +150,15 @@ export class StateStore {
 
     const defaultQuota: QuotaSettings = {
       defaultDailyQuotaGb: 6,
-      defaultDailyMaxFiles: 15,
-      maxSingleFileGb: 3.5,
+      defaultDailyMaxFiles: 10,
+      maxSingleFileGb: 4.0,
       enforceQuotas: true,
-      resetHourUtc: 0,
+      resetHourUtc: 5,
+      currentDateCuba: getCubaDateStr(),
+      maxSeriesPerDay: 0,
+      seriesUploadedToday: 0,
+      otherUploadedToday: 0,
+      poolAccounts: [],
     };
 
     this.config = this.readJson<RuntimeConfig>('runtime_config.json', defaultConfig);
@@ -133,12 +170,20 @@ export class StateStore {
       ...u,
       uploadMode: u.uploadMode === 'fast' ? 'fast' : 'wizard',
     }));
-    this.quotaSettings = this.readJson<QuotaSettings>('quota_settings.json', defaultQuota);
+    const rawQuota = this.readJson<QuotaSettings>('quota_settings.json', defaultQuota);
+    this.quotaSettings = {
+      ...defaultQuota,
+      ...rawQuota,
+      poolAccounts: Array.isArray(rawQuota.poolAccounts) ? rawQuota.poolAccounts : [],
+    };
     this.userSessions = this.readJson<UserPictaSession[]>('user_sessions.json', []);
     this.alerts = this.readJson<PictaAlertEvent[]>('alerts.json', []);
     this.watchedVideos = this.readJson<WatchedPictaVideo[]>('watched_videos.json', []);
     this.vaultSnapshots = this.readJson<VaultSnapshotRecord[]>('vault_snapshots.json', []);
     this.pinnedSeriesIds = this.readJson<number[]>('pinned_series.json', []);
+    this.pinnedBatchSeries = this.readJson<PinnedBatchSerie[]>('pinned_batch_series.json', []);
+    this.alertPreferences = this.readJson<UserAlertPreferences[]>('alert_preferences.json', []);
+    this.requestsGroupConfigs = this.readJson<UserRequestsGroupConfig[]>('requests_group_configs.json', []);
     this.channelRequests = this.readJson<ChannelRequestRecord[]>('channel_requests.json', []);
     this.ignoredCommentIds = this.readJson<number[]>('ignored_comments.json', []);
     this.promoChannels = this.readJson<PromoChannelRecord[]>('promo_channels.json', []);
@@ -234,7 +279,7 @@ export class StateStore {
           active: true,
           uploadMode: 'wizard',
           dailyQuotaGb: 50,
-          dailyMaxFiles: 200,
+          dailyMaxFiles: 10,
           usedTodayGb: 0,
           filesToday: 0,
           pictaLinked: Boolean(pictaUser),
@@ -247,16 +292,82 @@ export class StateStore {
     }
   }
 
+  public getAlertPrefsForUser(userId: string): UserAlertPreferences {
+    let pref = this.alertPreferences.find((p) => p.userId === userId);
+    if (!pref) {
+      pref = {
+        userId,
+        commentsEnabled: true,
+        milestonesEnabled: true,
+        enabledMetrics: {
+          plays: true,
+          likes: true,
+          downloads: true,
+          comments: true,
+        },
+        thresholds: [...DEFAULT_MILESTONE_THRESHOLDS],
+      };
+      this.alertPreferences.push(pref);
+      this.saveAlertPreferences();
+    }
+    return pref;
+  }
+
+  public getRequestsGroupConfigForUser(userId: string): UserRequestsGroupConfig {
+    let cfg = this.requestsGroupConfigs.find((c) => c.userId === userId);
+    if (!cfg) {
+      const firstPromo = this.promoChannels[0];
+      cfg = {
+        userId,
+        targetChannelId: firstPromo?.telegramChatId,
+        targetChannelLabel: firstPromo?.name,
+        requestsMonitorMode: 'off',
+      };
+      this.requestsGroupConfigs.push(cfg);
+      this.saveRequestsGroupConfigs();
+    }
+    return cfg;
+  }
+
+  public getPinnedSerieForUser(userId: string): PinnedBatchSerie | undefined {
+    return this.pinnedBatchSeries.find((p) => p.userId === userId);
+  }
+
+  public setPinnedSerieForUser(pinned: PinnedBatchSerie | null, userId: string): void {
+    this.pinnedBatchSeries = this.pinnedBatchSeries.filter((p) => p.userId !== userId);
+    if (pinned) {
+      this.pinnedBatchSeries.push(pinned);
+      if (!this.pinnedSeriesIds.includes(pinned.serieId)) {
+        this.pinnedSeriesIds.push(pinned.serieId);
+        this.savePinnedSeries();
+      }
+    }
+    this.savePinnedBatchSeries();
+  }
+
   public resetDailyQuotasIfNeeded(): boolean {
-    const now = new Date();
-    const adjusted = new Date(now.getTime() - this.quotaSettings.resetHourUtc * 3600_000);
-    const todayKey = adjusted.toISOString().slice(0, 10);
+    const todayCuba = getCubaDateStr();
     let changed = false;
+
+    if (this.quotaSettings.currentDateCuba !== todayCuba) {
+      this.quotaSettings.currentDateCuba = todayCuba;
+      this.quotaSettings.seriesUploadedToday = 0;
+      this.quotaSettings.otherUploadedToday = 0;
+      if (Array.isArray(this.quotaSettings.poolAccounts)) {
+        for (const acc of this.quotaSettings.poolAccounts) {
+          acc.uploadedToday = 0;
+          acc.exhaustedDate = undefined;
+        }
+      }
+      this.saveQuotaSettings();
+      changed = true;
+    }
+
     for (const user of this.users) {
-      if (user.lastQuotaResetDay !== todayKey) {
+      if (user.lastQuotaResetDay !== todayCuba) {
         user.usedTodayGb = 0;
         user.filesToday = 0;
-        user.lastQuotaResetDay = todayKey;
+        user.lastQuotaResetDay = todayCuba;
         changed = true;
       }
     }
@@ -303,7 +414,9 @@ export class StateStore {
   public saveJobs(): void {
     if (this.jobs.length > MAX_JOBS_HISTORY) {
       const active = this.jobs.filter((j) => ACTIVE_STATUSES.has(j.status));
-      const finished = this.jobs.filter((j) => !ACTIVE_STATUSES.has(j.status)).slice(0, Math.max(20, MAX_JOBS_HISTORY - active.length));
+      const finished = this.jobs
+        .filter((j) => !ACTIVE_STATUSES.has(j.status))
+        .slice(0, Math.max(20, MAX_JOBS_HISTORY - active.length));
       this.jobs = [...active, ...finished].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     }
     this.atomicWriteJson('jobs.json', this.jobs);
@@ -337,6 +450,18 @@ export class StateStore {
 
   public savePinnedSeries(): void {
     this.atomicWriteJson('pinned_series.json', this.pinnedSeriesIds);
+  }
+
+  public savePinnedBatchSeries(): void {
+    this.atomicWriteJson('pinned_batch_series.json', this.pinnedBatchSeries);
+  }
+
+  public saveAlertPreferences(): void {
+    this.atomicWriteJson('alert_preferences.json', this.alertPreferences);
+  }
+
+  public saveRequestsGroupConfigs(): void {
+    this.atomicWriteJson('requests_group_configs.json', this.requestsGroupConfigs);
   }
 
   public saveChannelRequests(): void {
@@ -373,6 +498,9 @@ export class StateStore {
     this.saveWatchedVideos();
     this.saveVaultSnapshots();
     this.savePinnedSeries();
+    this.savePinnedBatchSeries();
+    this.saveAlertPreferences();
+    this.saveRequestsGroupConfigs();
     this.saveChannelRequests();
     this.saveIgnoredComments();
     this.savePromoChannels();
@@ -389,6 +517,9 @@ export class StateStore {
       watchedVideos: this.watchedVideos,
       vaultSnapshots: this.vaultSnapshots,
       pinnedSeriesIds: this.pinnedSeriesIds,
+      pinnedBatchSeries: this.pinnedBatchSeries,
+      alertPreferences: this.alertPreferences,
+      requestsGroupConfigs: this.requestsGroupConfigs,
       channelRequests: this.channelRequests,
       ignoredCommentIds: this.ignoredCommentIds,
       promoChannels: this.promoChannels,
@@ -405,11 +536,22 @@ export class StateStore {
         uploadMode: u.uploadMode === 'fast' ? 'fast' : 'wizard',
       }));
     }
-    if (bundle.quotaSettings) this.quotaSettings = { ...this.quotaSettings, ...bundle.quotaSettings };
+    if (bundle.quotaSettings) {
+      this.quotaSettings = {
+        ...this.quotaSettings,
+        ...bundle.quotaSettings,
+        poolAccounts: Array.isArray(bundle.quotaSettings.poolAccounts)
+          ? bundle.quotaSettings.poolAccounts
+          : this.quotaSettings.poolAccounts || [],
+      };
+    }
     if (Array.isArray(bundle.userSessions)) this.userSessions = bundle.userSessions;
     if (Array.isArray(bundle.alerts)) this.alerts = bundle.alerts;
     if (Array.isArray(bundle.watchedVideos)) this.watchedVideos = bundle.watchedVideos;
     if (Array.isArray(bundle.pinnedSeriesIds)) this.pinnedSeriesIds = bundle.pinnedSeriesIds;
+    if (Array.isArray(bundle.pinnedBatchSeries)) this.pinnedBatchSeries = bundle.pinnedBatchSeries;
+    if (Array.isArray(bundle.alertPreferences)) this.alertPreferences = bundle.alertPreferences;
+    if (Array.isArray(bundle.requestsGroupConfigs)) this.requestsGroupConfigs = bundle.requestsGroupConfigs;
     if (Array.isArray(bundle.channelRequests)) this.channelRequests = bundle.channelRequests;
     if (Array.isArray(bundle.ignoredCommentIds)) this.ignoredCommentIds = bundle.ignoredCommentIds;
     if (Array.isArray(bundle.promoChannels)) this.promoChannels = bundle.promoChannels;
