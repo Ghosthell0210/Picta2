@@ -721,7 +721,9 @@ async function createServer() {
 
   // Mount Vite middleware in development or static dist in production / compiled bundle
   const distDir = path.resolve(process.cwd(), 'dist');
-  const runningCompiledBundle = Boolean(process.argv[1]?.endsWith('server.js'));
+  const runningCompiledBundle = Boolean(
+    process.argv[1]?.endsWith('server.js') || process.argv[1]?.endsWith('index.js')
+  );
   const isProd = process.env.NODE_ENV === 'production' || (runningCompiledBundle && fs.existsSync(path.join(distDir, 'index.html')));
 
   if (!isProd) {
@@ -747,7 +749,7 @@ async function createServer() {
     });
   }
 
-  const port = Number(process.env.PORT || process.env.SERVER_PORT || 3000);
+  const port = Number(process.env.SERVER_PORT || process.env.PORT || 3000);
   const server = app.listen(port, '0.0.0.0', () => {
     console.log(`[PictaBot Altare] Servidor activo en http://0.0.0.0:${port} (${isProd ? 'production' : 'development'})`);
     void telegramRuntime.start();
