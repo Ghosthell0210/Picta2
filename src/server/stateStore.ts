@@ -1,8 +1,11 @@
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import type {
   AuthorizedUser,
+  ChannelRequestRecord,
   PictaAlertEvent,
+  PromoChannelRecord,
   QuotaSettings,
   RuntimeConfig,
   TelegramTransportMode,
@@ -12,6 +15,13 @@ import type {
   WatchedPictaVideo,
 } from '../shared/types.ts';
 import { netlog } from './netlog.ts';
+
+const ACTIVE_STATUSES = new Set(['queued', 'downloading', 'assembling', 'uploading', 'encoding_nomad']);
+const MAX_JOBS_HISTORY = 120;
+const MAX_ALERTS_HISTORY = 100;
+const MAX_REQUESTS_HISTORY = 200;
+const MAX_IGNORED_COMMENTS = 500;
+const MAX_VAULT_SNAPSHOTS = 25;
 
 function clampNumber(val: number, min: number, max: number, fallback: number): number {
   if (!Number.isFinite(val)) return fallback;
@@ -55,6 +65,10 @@ export interface PersistedStateBundle {
   alerts: PictaAlertEvent[];
   watchedVideos: WatchedPictaVideo[];
   vaultSnapshots: VaultSnapshotRecord[];
+  pinnedSeriesIds: number[];
+  channelRequests: ChannelRequestRecord[];
+  ignoredCommentIds: number[];
+  promoChannels: PromoChannelRecord[];
 }
 
 export class StateStore {
@@ -69,7 +83,14 @@ export class StateStore {
   public alerts: PictaAlertEvent[] = [];
   public watchedVideos: WatchedPictaVideo[] = [];
   public vaultSnapshots: VaultSnapshotRecord[] = [];
+  public pinnedSeriesIds: number[] = [];
+  public channelRequests: ChannelRequestRecord[] = [];
+  public ignoredCommentIds: number[] = [];
+  public promoChannels: PromoChannelRecord[] = [];
   public mtprotoSessionString = '';
+
+  private secretKeyCache: Buffer | null = null;
+  private masterAdminIdsCache: Set<string>;
 
   constructor() {
     this.stateDir = resolveStateDir();
@@ -104,28 +125,32 @@ export class StateStore {
     };
 
     this.config = this.readJson<RuntimeConfig>('runtime_config.json', defaultConfig);
-    // Keep env mode/url synced if explicitly provided
-    if (process.env.TELEGRAM_MODE) {
-      this.config.telegramMode = envMode;
-    }
-    if (process.env.APP_URL && !this.config.appUrl) {
-      this.config.appUrl = process.env.APP_URL.trim();
-    }
+    if (process.env.TELEGRAM_MODE) this.config.telegramMode = envMode;
+    if (process.env.APP_URL && !this.config.appUrl) this.config.appUrl = process.env.APP_URL.trim();
 
     this.jobs = this.readJson<TransferJob[]>('jobs.json', []);
-    this.users = this.readJson<AuthorizedUser[]>('authorized_users.json', []);
+    this.users = this.readJson<AuthorizedUser[]>('authorized_users.json', []).map((u) => ({
+      ...u,
+      uploadMode: u.uploadMode === 'fast' ? 'fast' : 'wizard',
+    }));
     this.quotaSettings = this.readJson<QuotaSettings>('quota_settings.json', defaultQuota);
     this.userSessions = this.readJson<UserPictaSession[]>('user_sessions.json', []);
     this.alerts = this.readJson<PictaAlertEvent[]>('alerts.json', []);
     this.watchedVideos = this.readJson<WatchedPictaVideo[]>('watched_videos.json', []);
     this.vaultSnapshots = this.readJson<VaultSnapshotRecord[]>('vault_snapshots.json', []);
+    this.pinnedSeriesIds = this.readJson<number[]>('pinned_series.json', []);
+    this.channelRequests = this.readJson<ChannelRequestRecord[]>('channel_requests.json', []);
+    this.ignoredCommentIds = this.readJson<number[]>('ignored_comments.json', []);
+    this.promoChannels = this.readJson<PromoChannelRecord[]>('promo_channels.json', []);
 
     const mtSessionFile = this.readJson<{ session: string; updatedAt?: string }>('mtproto_session.json', {
       session: '',
     });
     this.mtprotoSessionString = (process.env.TELEGRAM_MTPROTO_SESSION || '').trim() || mtSessionFile.session || '';
 
+    this.masterAdminIdsCache = this.parseMasterAdminIds();
     this.seedAdminIdsFromEnv();
+    this.resetDailyQuotasIfNeeded();
     this.persistAll();
 
     netlog.info('system', `Estado persistente inicializado en ${this.stateDir}`, {
@@ -134,20 +159,71 @@ export class StateStore {
     });
   }
 
-  private seedAdminIdsFromEnv(): void {
+  private parseMasterAdminIds(): Set<string> {
     const combinedRaw = [process.env.MASTER_ADMIN_CHAT_ID || '', process.env.ADMIN_TELEGRAM_IDS || ''].join(',');
-    const rawIds = Array.from(
-      new Set(
-        combinedRaw
-          .split(',')
-          .map((s) => s.trim())
-          .filter((s) => /^\d+$/.test(s))
-      )
+    return new Set(
+      combinedRaw
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s) => /^\d+$/.test(s))
     );
+  }
 
-    const pictaUser = (process.env.PICTA_USERNAME || process.env.PICTA_DEFAULT_USERNAME || '').trim();
+  public isMasterAdmin(telegramUserId: string): boolean {
+    const clean = String(telegramUserId || '').trim();
+    if (!clean) return false;
+    if (this.masterAdminIdsCache.size > 0) {
+      return this.masterAdminIdsCache.has(clean);
+    }
+    const user = this.users.find((u) => u.telegramUserId === clean && u.active);
+    return user?.role === 'admin';
+  }
+
+  public getPrimaryAdminChatId(): string {
+    const firstMaster = Array.from(this.masterAdminIdsCache)[0];
+    if (firstMaster) return firstMaster;
+    return this.users.find((u) => u.role === 'admin' && u.active)?.telegramUserId || '';
+  }
+
+  private getSessionSecretKey(): Buffer {
+    if (this.secretKeyCache) return this.secretKeyCache;
+    const rawMaterial =
+      (process.env.VAULT_ENCRYPTION_KEY || '').trim() ||
+      (process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '').trim() ||
+      `pictabot-local:${this.stateDir}`;
+    this.secretKeyCache = crypto.createHash('sha256').update(`pictabot-user-secret:${rawMaterial}`).digest();
+    return this.secretKeyCache;
+  }
+
+  public encryptUserSecret(plaintext: string): string {
+    const key = this.getSessionSecretKey();
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    const enc = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    return `v1:${iv.toString('base64')}:${tag.toString('base64')}:${enc.toString('base64')}`;
+  }
+
+  public decryptUserSecret(ciphertext: string): string | null {
+    try {
+      const parts = String(ciphertext || '').split(':');
+      if (parts.length !== 4 || parts[0] !== 'v1') return null;
+      const key = this.getSessionSecretKey();
+      const iv = Buffer.from(parts[1], 'base64');
+      const tag = Buffer.from(parts[2], 'base64');
+      const data = Buffer.from(parts[3], 'base64');
+      const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+      decipher.setAuthTag(tag);
+      return Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
+    } catch {
+      return null;
+    }
+  }
+
+  private seedAdminIdsFromEnv(): void {
+    const pictaUser = (process.env.PICTA_USERNAME || process.env.PICTA_DEFAULT_USERNAME || process.env.PICTA_USER || '').trim();
     const now = new Date().toISOString();
-    for (const id of rawIds) {
+    for (const id of this.masterAdminIdsCache) {
       const existing = this.users.find((u) => u.telegramUserId === id);
       if (!existing) {
         this.users.push({
@@ -156,8 +232,9 @@ export class StateStore {
           displayName: `Administrador (${id})`,
           role: 'admin',
           active: true,
-          dailyQuotaGb: 25,
-          dailyMaxFiles: 100,
+          uploadMode: 'wizard',
+          dailyQuotaGb: 50,
+          dailyMaxFiles: 200,
           usedTodayGb: 0,
           filesToday: 0,
           pictaLinked: Boolean(pictaUser),
@@ -168,6 +245,25 @@ export class StateStore {
         });
       }
     }
+  }
+
+  public resetDailyQuotasIfNeeded(): boolean {
+    const now = new Date();
+    const adjusted = new Date(now.getTime() - this.quotaSettings.resetHourUtc * 3600_000);
+    const todayKey = adjusted.toISOString().slice(0, 10);
+    let changed = false;
+    for (const user of this.users) {
+      if (user.lastQuotaResetDay !== todayKey) {
+        user.usedTodayGb = 0;
+        user.filesToday = 0;
+        user.lastQuotaResetDay = todayKey;
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.saveUsers();
+    }
+    return changed;
   }
 
   private filePath(fileName: string): string {
@@ -181,9 +277,7 @@ export class StateStore {
   private readJson<T>(fileName: string, fallback: T): T {
     const target = this.filePath(fileName);
     try {
-      if (!fs.existsSync(target)) {
-        return fallback;
-      }
+      if (!fs.existsSync(target)) return fallback;
       const raw = fs.readFileSync(target, 'utf8');
       if (!raw.trim()) return fallback;
       return JSON.parse(raw) as T;
@@ -198,7 +292,7 @@ export class StateStore {
   private atomicWriteJson(fileName: string, data: unknown): void {
     const target = this.filePath(fileName);
     const tmpTarget = `${target}.${process.pid}.${Date.now()}.tmp`;
-    fs.writeFileSync(tmpTarget, JSON.stringify(data, null, 2), 'utf8');
+    fs.writeFileSync(tmpTarget, JSON.stringify(data), 'utf8');
     fs.renameSync(tmpTarget, target);
   }
 
@@ -207,6 +301,11 @@ export class StateStore {
   }
 
   public saveJobs(): void {
+    if (this.jobs.length > MAX_JOBS_HISTORY) {
+      const active = this.jobs.filter((j) => ACTIVE_STATUSES.has(j.status));
+      const finished = this.jobs.filter((j) => !ACTIVE_STATUSES.has(j.status)).slice(0, Math.max(20, MAX_JOBS_HISTORY - active.length));
+      this.jobs = [...active, ...finished].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    }
     this.atomicWriteJson('jobs.json', this.jobs);
   }
 
@@ -223,6 +322,7 @@ export class StateStore {
   }
 
   public saveAlerts(): void {
+    if (this.alerts.length > MAX_ALERTS_HISTORY) this.alerts.length = MAX_ALERTS_HISTORY;
     this.atomicWriteJson('alerts.json', this.alerts);
   }
 
@@ -231,7 +331,28 @@ export class StateStore {
   }
 
   public saveVaultSnapshots(): void {
+    if (this.vaultSnapshots.length > MAX_VAULT_SNAPSHOTS) this.vaultSnapshots.length = MAX_VAULT_SNAPSHOTS;
     this.atomicWriteJson('vault_snapshots.json', this.vaultSnapshots);
+  }
+
+  public savePinnedSeries(): void {
+    this.atomicWriteJson('pinned_series.json', this.pinnedSeriesIds);
+  }
+
+  public saveChannelRequests(): void {
+    if (this.channelRequests.length > MAX_REQUESTS_HISTORY) this.channelRequests.length = MAX_REQUESTS_HISTORY;
+    this.atomicWriteJson('channel_requests.json', this.channelRequests);
+  }
+
+  public saveIgnoredComments(): void {
+    if (this.ignoredCommentIds.length > MAX_IGNORED_COMMENTS) {
+      this.ignoredCommentIds = this.ignoredCommentIds.slice(-MAX_IGNORED_COMMENTS);
+    }
+    this.atomicWriteJson('ignored_comments.json', this.ignoredCommentIds);
+  }
+
+  public savePromoChannels(): void {
+    this.atomicWriteJson('promo_channels.json', this.promoChannels);
   }
 
   public saveMtprotoSession(session: string): void {
@@ -251,6 +372,10 @@ export class StateStore {
     this.saveAlerts();
     this.saveWatchedVideos();
     this.saveVaultSnapshots();
+    this.savePinnedSeries();
+    this.saveChannelRequests();
+    this.saveIgnoredComments();
+    this.savePromoChannels();
   }
 
   public exportBundle(): PersistedStateBundle & { mtprotoSessionString: string } {
@@ -263,6 +388,10 @@ export class StateStore {
       alerts: this.alerts,
       watchedVideos: this.watchedVideos,
       vaultSnapshots: this.vaultSnapshots,
+      pinnedSeriesIds: this.pinnedSeriesIds,
+      channelRequests: this.channelRequests,
+      ignoredCommentIds: this.ignoredCommentIds,
+      promoChannels: this.promoChannels,
       mtprotoSessionString: this.mtprotoSessionString,
     };
   }
@@ -270,32 +399,25 @@ export class StateStore {
   public importBundle(bundle: Partial<PersistedStateBundle & { mtprotoSessionString?: string }>): void {
     if (bundle.config) this.config = { ...this.config, ...bundle.config };
     if (Array.isArray(bundle.jobs)) this.jobs = bundle.jobs;
-    if (Array.isArray(bundle.users)) this.users = bundle.users;
+    if (Array.isArray(bundle.users)) {
+      this.users = bundle.users.map((u) => ({
+        ...u,
+        uploadMode: u.uploadMode === 'fast' ? 'fast' : 'wizard',
+      }));
+    }
     if (bundle.quotaSettings) this.quotaSettings = { ...this.quotaSettings, ...bundle.quotaSettings };
     if (Array.isArray(bundle.userSessions)) this.userSessions = bundle.userSessions;
     if (Array.isArray(bundle.alerts)) this.alerts = bundle.alerts;
     if (Array.isArray(bundle.watchedVideos)) this.watchedVideos = bundle.watchedVideos;
+    if (Array.isArray(bundle.pinnedSeriesIds)) this.pinnedSeriesIds = bundle.pinnedSeriesIds;
+    if (Array.isArray(bundle.channelRequests)) this.channelRequests = bundle.channelRequests;
+    if (Array.isArray(bundle.ignoredCommentIds)) this.ignoredCommentIds = bundle.ignoredCommentIds;
+    if (Array.isArray(bundle.promoChannels)) this.promoChannels = bundle.promoChannels;
     if (typeof bundle.mtprotoSessionString === 'string' && bundle.mtprotoSessionString.trim()) {
       this.saveMtprotoSession(bundle.mtprotoSessionString);
     }
+    this.seedAdminIdsFromEnv();
     this.persistAll();
-  }
-
-  public verifyDirectoryWritable(): { stateWritable: boolean; scratchWritable: boolean } {
-    const checkDir = (dir: string) => {
-      try {
-        const probe = path.join(dir, `.write_probe_${Date.now()}`);
-        fs.writeFileSync(probe, 'ok', 'utf8');
-        fs.unlinkSync(probe);
-        return true;
-      } catch {
-        return false;
-      }
-    };
-    return {
-      stateWritable: checkDir(this.stateDir),
-      scratchWritable: checkDir(this.scratchDir),
-    };
   }
 }
 

@@ -228,6 +228,13 @@ export class MtprotoPoolManager {
       if (fatalError) {
         throw fatalError;
       }
+    } catch (err) {
+      try {
+        if (fs.existsSync(params.fullPath)) fs.rmSync(params.fullPath, { force: true });
+      } catch {
+        // Ignore cleanup failure
+      }
+      throw err;
     } finally {
       await fh.close();
     }

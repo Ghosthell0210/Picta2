@@ -1,5 +1,7 @@
 export type TelegramTransportMode = 'polling' | 'webhook';
 
+export type UploadMode = 'wizard' | 'fast';
+
 export type TransferJobStatus =
   | 'queued'
   | 'downloading'
@@ -10,13 +12,14 @@ export type TransferJobStatus =
   | 'failed'
   | 'cancelled';
 
-export type TransferJobSource = 'telegram_mtproto' | 'unir_assembler' | 'manual_queue';
+export type TransferJobSource = 'telegram_mtproto' | 'unir_assembler';
 
 export interface TransferJob {
   id: string;
   userId: string;
   userName: string;
   title: string;
+  description?: string;
   fileName: string;
   source: TransferJobSource;
   sizeBytes: number;
@@ -28,11 +31,25 @@ export interface TransferJob {
   nomadRetries: number;
   maxNomadRetries: number;
   pictaVideoId?: string;
+  pictaWebUrl?: string;
   pictaChannel?: string;
+  pictaChannelId?: string;
   minioKey?: string;
   tipologia?: number;
+  clasificacion?: string;
+  keywords?: string;
+  publicado?: boolean;
+  descargable?: boolean;
+  autoPromo?: boolean;
+  serieId?: number;
+  temporada?: string;
+  numero?: string;
+  coverUrl?: string;
+  posterUrl?: string;
+  customCoverPath?: string;
   telegramChatId?: string;
   telegramMessageId?: number;
+  statusMessageId?: number;
   scratchPath?: string;
   partCount?: number;
   errorMessage?: string;
@@ -48,10 +65,12 @@ export interface AuthorizedUser {
   displayName: string;
   role: UserRole;
   active: boolean;
+  uploadMode: UploadMode;
   dailyQuotaGb: number;
   dailyMaxFiles: number;
   usedTodayGb: number;
   filesToday: number;
+  lastQuotaResetDay?: string;
   pictaLinked: boolean;
   pictaUsername?: string;
   alertsEnabled: boolean;
@@ -67,15 +86,26 @@ export interface QuotaSettings {
   resetHourUtc: number;
 }
 
+export interface OwnedPictaChannel {
+  id: number;
+  nombre: string;
+  alias?: string;
+  slug_url?: string;
+}
+
 export interface UserPictaSession {
   telegramUserId: string;
   pictaUsername: string;
+  encryptedPassword: string;
   defaultChannel: string;
+  channelId: string;
+  channelName: string;
+  pictaUserId?: number;
+  availableChannels: OwnedPictaChannel[];
   connectedAt: string;
   lastVerifiedAt: string;
   notifyComments: boolean;
   notifyMilestones: boolean;
-  hasEncryptedToken: boolean;
 }
 
 export type PictaAlertType = 'comment' | 'milestone' | 'nomad_ready' | 'nomad_error';
@@ -103,6 +133,125 @@ export interface WatchedPictaVideo {
   lastMilestoneNotified: number;
   nomadStatus: 'ready' | 'encoding' | 'failed';
   updatedAt: string;
+}
+
+export interface PictaChannelProfile {
+  id: number;
+  nombre: string;
+  alias: string;
+  descripcion: string;
+  clasificacion: string;
+  slug_url?: string;
+  visible: boolean;
+  publicado: boolean;
+  cantidad_suscriptores: number;
+  cantidad_publicaciones: number;
+  url_avatar?: string;
+  url_imagen?: string;
+}
+
+export interface PictaCatalogItem {
+  id: string;
+  nombre: string;
+  descripcion: string;
+  slug?: string;
+  webUrl: string;
+  tipologiaId?: number;
+  tipologiaNombre: string;
+  clasificacion: string;
+  cantidad_vistas: number;
+  cantidad_comentarios: number;
+  cantidad_me_gusta: number;
+  cantidad_descargas: number;
+  publicado: boolean;
+  descargable: boolean;
+  estado_codificacion?: string;
+  url_imagen?: string;
+  imagen_secundaria?: string;
+  url_descarga?: string;
+  url_manifiesto?: string;
+  fecha_creacion?: string;
+}
+
+export interface PictaSerieItem {
+  id: number;
+  nombre: string;
+  descripcion: string;
+  canalId: number;
+  cantidad_capitulos: number;
+  url_imagen?: string;
+  imagen_secundaria?: string;
+  publicado: boolean;
+  pinned?: boolean;
+}
+
+export interface PictaPlaylistItem {
+  id: number;
+  nombre: string;
+  publicado: boolean;
+  descarga: boolean;
+  fecha_creacion?: string;
+  canalId: number;
+  canalNombre: string;
+  publicacionesIds: number[];
+}
+
+export interface PictaCommentItem {
+  id: number;
+  texto: string;
+  usuario: string;
+  usuarioId?: number;
+  fecha: string;
+  publicacionId: number;
+  publicacionNombre: string;
+  categoriaNombre: string;
+  parentId?: number;
+  replyCount: number;
+  answered: boolean;
+  isLikelyRequest: boolean;
+  ignored?: boolean;
+}
+
+export interface PictaDenunciasSummary {
+  cantidad_pendientes: number;
+  cantidad_en_proceso: number;
+  cantidad_no_proceden: number;
+  cantidad_procesadas: number;
+  total: number;
+}
+
+export interface ChannelRequestRecord {
+  id: string;
+  commentId?: number;
+  requesterName: string;
+  requestedTitle: string;
+  rawText: string;
+  sourceVideoTitle: string;
+  status: 'pending' | 'fulfilled' | 'ignored';
+  createdAt: string;
+}
+
+export interface PromoChannelRecord {
+  id: string;
+  name: string;
+  telegramChatId: string;
+  inviteUrl?: string;
+  autoPostEnabled: boolean;
+  createdAt: string;
+}
+
+export interface TmdbEnrichedCandidate {
+  id: number;
+  title: string;
+  originalTitle?: string;
+  mediaType: 'movie' | 'tv';
+  year?: string;
+  overview: string;
+  posterUrl?: string;
+  backdropUrl?: string;
+  voteAverage?: number;
+  popularity?: number;
+  score: number;
 }
 
 export type NetlogCategory = 'mtproto' | 'picta' | 'disk' | 'vault' | 'telegram' | 'assembler' | 'system';
@@ -176,20 +325,11 @@ export interface VaultSnapshotRecord {
   message: string;
 }
 
-export interface EnvCheckItem {
-  key: string;
-  configured: boolean;
-  requiredForProduction: boolean;
-  category: 'telegram' | 'mtproto' | 'picta' | 'storage' | 'vault' | 'security';
-  description: string;
-}
-
 export interface RuntimeTelemetry {
   startedAt: string;
   uptimeSeconds: number;
   nodeEnv: string;
   isCloudRunDetected: boolean;
-  cloudRunKeepAliveActive: boolean;
   telegram: {
     mode: TelegramTransportMode;
     botConfigured: boolean;
@@ -227,24 +367,4 @@ export interface RuntimeTelemetry {
     snapshotsCount: number;
   };
   binaries: SystemBinariesStatus;
-}
-
-export interface AuthStatusResponse {
-  requiresClaim: boolean;
-  envPasscodeConfigured: boolean;
-  authenticated: boolean;
-}
-
-export interface DashboardBootstrapResponse {
-  telemetry: RuntimeTelemetry;
-  config: RuntimeConfig;
-  disk: DiskStatusReport;
-  jobs: TransferJob[];
-  users: AuthorizedUser[];
-  quotaSettings: QuotaSettings;
-  alerts: PictaAlertEvent[];
-  watchedVideos: WatchedPictaVideo[];
-  netlog: NetlogEntry[];
-  vaultSnapshots: VaultSnapshotRecord[];
-  envChecks: EnvCheckItem[];
 }

@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import type { NetlogCategory, NetlogEntry, NetlogLevel } from '../shared/types.ts';
 
-const MAX_NETLOG_ENTRIES = 300;
+const MAX_NETLOG_ENTRIES = 200;
 
 export interface NetlogOpts {
   latencyMs?: number;

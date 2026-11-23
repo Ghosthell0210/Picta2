@@ -216,7 +216,7 @@ export async function saveCloudStateToTelegramNow(includeMtproto = true): Promis
   const plaintext = JSON.stringify(payloadObj);
 
   const envelope = encryptBundlePayload(plaintext, includeMtproto && Boolean(bundle.mtprotoSessionString));
-  const envelopeJson = JSON.stringify(envelope, null, 2);
+  const envelopeJson = JSON.stringify(envelope);
 
   // 1. Persist local encrypted archive atomically
   const localPath = getLocalVaultArchivePath();
@@ -274,7 +274,9 @@ export async function saveCloudStateToTelegramNow(includeMtproto = true): Promis
       const compactState = JSON.stringify({
         users: stateStore.users,
         quotaSettings: stateStore.quotaSettings,
-        watchedVideos: stateStore.watchedVideos.slice(0, 25),
+        watchedVideos: stateStore.watchedVideos.slice(0, 20),
+        pinnedSeriesIds: stateStore.pinnedSeriesIds.slice(0, 30),
+        promoChannels: stateStore.promoChannels.slice(0, 15),
       });
       const eoOk = await syncSetMyCommandsScope(botToken, masterChatId, 'eo', compactState);
       let iaOk = true;

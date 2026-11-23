@@ -6,6 +6,8 @@ import { pathToFileURL } from 'url';
 const rootDir = process.cwd();
 const serverBundle = path.join(rootDir, 'dist', 'server.js');
 const legacyRootBundle = path.join(rootDir, 'server.js');
+
+// Plugged Host safety: ensure index.js is the ONLY .js file in root
 if (fs.existsSync(legacyRootBundle)) {
   try {
     fs.rmSync(legacyRootBundle, { force: true });
@@ -13,10 +15,10 @@ if (fs.existsSync(legacyRootBundle)) {
     // Ignore cleanup error
   }
 }
-const distIndex = path.join(rootDir, 'dist', 'index.html');
+
 const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
-if (!fs.existsSync(serverBundle) || !fs.existsSync(distIndex)) {
+if (!fs.existsSync(serverBundle)) {
   const esbuildBin = path.join(
     rootDir,
     'node_modules',
@@ -37,7 +39,7 @@ if (!fs.existsSync(serverBundle) || !fs.existsSync(distIndex)) {
     }
   }
 
-  console.log('[PictaBot] Compilando panel web y servidor (npm run build)...');
+  console.log('[PictaBot] Compilando bot headless optimizado (npm run build)...');
   const build = spawnSync(npmBin, ['run', 'build'], {
     cwd: rootDir,
     stdio: 'inherit',
