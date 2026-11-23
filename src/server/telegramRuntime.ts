@@ -184,11 +184,21 @@ export class TelegramBotRuntime {
     this.startBackgroundLoops();
     netlog.info('system', 'Modo bot headless 24/7 iniciado (sin panel web).');
 
-    await mtprotoPool.connectIfConfigured();
+    // Start Telegram Bot API polling/webhook immediately so commands respond even while MTProto connects
     await this.applyTransportMode();
     if (this.getBotToken()) {
       void tgRegisterDefaultCommands();
     }
+
+    // Connect MTProto FastSocket in parallel without blocking bot command handling
+    void mtprotoPool
+      .connectIfConfigured()
+      .then((ok) => {
+        console.log(`[PictaBot] MTProto FastSocket: ${ok ? 'CONECTADO' : 'EN ESPERA'}`);
+      })
+      .catch((err) => {
+        console.warn(`[PictaBot] MTProto aviso: ${err instanceof Error ? err.message : String(err)}`);
+      });
   }
 
   public async applyTransportMode(): Promise<void> {
@@ -199,6 +209,7 @@ export class TelegramBotRuntime {
 
     if (!token) {
       netlog.info('telegram', 'Bot en espera: define TELEGRAM_BOT_TOKEN en el entorno.');
+      console.log('[PictaBot] Telegram en espera (falta TELEGRAM_BOT_TOKEN).');
       return;
     }
 
@@ -233,6 +244,7 @@ export class TelegramBotRuntime {
           this.webhookUrl = targetUrl;
           this.lastError = undefined;
           netlog.info('telegram', `Webhook HTTPS registrado en ${targetUrl}`);
+          console.log(`[PictaBot] Telegram Webhook activo (@${this.botUsername || 'bot'}) -> ${targetUrl}`);
           return;
         }
         this.lastError = body.description || 'Error registrando Webhook';
@@ -250,6 +262,7 @@ export class TelegramBotRuntime {
     }
 
     this.startPollingLoop();
+    console.log(`[PictaBot] Telegram Long Polling 24/7 activo (@${this.botUsername || 'bot'}).`);
   }
 
   private stopPollingLoop(): void {

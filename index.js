@@ -5,6 +5,7 @@ import { pathToFileURL } from 'url';
 
 const rootDir = process.cwd();
 const serverBundle = path.join(rootDir, 'dist', 'server.js');
+const serverTsEntry = path.join(rootDir, 'server.ts');
 const legacyRootBundle = path.join(rootDir, 'server.js');
 
 // Plugged Host safety: ensure index.js is the ONLY .js file in root
@@ -16,38 +17,38 @@ if (fs.existsSync(legacyRootBundle)) {
   }
 }
 
-const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-
-if (!fs.existsSync(serverBundle)) {
-  const esbuildBin = path.join(
-    rootDir,
-    'node_modules',
-    '.bin',
-    process.platform === 'win32' ? 'esbuild.cmd' : 'esbuild'
-  );
-
-  if (!fs.existsSync(esbuildBin)) {
-    console.log('[PictaBot] Instalando dependencias de compilacion (npm install --include=dev)...');
-    const inst = spawnSync(npmBin, ['install', '--include=dev'], {
-      cwd: rootDir,
-      stdio: 'inherit',
-      shell: false,
-    });
-    if (inst.status !== 0) {
-      console.error('[PictaBot] Error instalando dependencias.');
-      process.exit(inst.status || 1);
+function getLatestSourceMtimeMs(dirPath) {
+  let latest = 0;
+  if (!fs.existsSync(dirPath)) return latest;
+  const stat = fs.statSync(dirPath);
+  if (stat.isFile()) return stat.mtimeMs;
+  for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
+    const full = path.join(dirPath, entry.name);
+    try {
+      if (entry.isDirectory()) {
+        latest = Math.max(latest, getLatestSourceMtimeMs(full));
+      } else if (entry.isFile() && /\.(ts|json)$/.test(entry.name)) {
+        latest = Math.max(latest, fs.statSync(full).mtimeMs);
+      }
+    } catch {
+      // Skip transient entries
     }
   }
+  return latest;
+}
 
-  console.log('[PictaBot] Compilando bot headless optimizado (npm run build)...');
-  const build = spawnSync(npmBin, ['run', 'build'], {
-    cwd: rootDir,
-    stdio: 'inherit',
-    shell: false,
-  });
-  if (build.status !== 0) {
-    console.error('[PictaBot] Error compilando el proyecto.');
-    process.exit(build.status || 1);
+function isBundleStale() {
+  if (!fs.existsSync(serverBundle)) return true;
+  try {
+    const bundleMtime = fs.statSync(serverBundle).mtimeMs;
+    const latestSrc = Math.max(
+      getLatestSourceMtimeMs(serverTsEntry),
+      getLatestSourceMtimeMs(path.join(rootDir, 'package.json')),
+      getLatestSourceMtimeMs(path.join(rootDir, 'src'))
+    );
+    return latestSrc > bundleMtime + 500;
+  } catch {
+    return true;
   }
 }
 
@@ -67,13 +68,42 @@ if (legacyServerFile && fs.existsSync(importScript) && !fs.existsSync(envFile)) 
   if (imp.status === 0 && fs.existsSync(envFile)) {
     try {
       fs.rmSync(legacyServerFile, { force: true });
-      console.log(`[PictaBot] .env generado correctamente y ${path.basename(legacyServerFile)} eliminado del contenedor.`);
+      console.log(`[PictaBot] .env generado correctamente y ${path.basename(legacyServerFile)} eliminado.`);
     } catch {
       // Ignore removal error
     }
   }
 }
 
+const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+let useNativeTsFallback = false;
+
+if (isBundleStale()) {
+  console.log('[PictaBot] Codigo actualizado detectado -> compilando dist/server.js...');
+  const build = spawnSync(npmBin, ['run', 'build'], {
+    cwd: rootDir,
+    stdio: 'inherit',
+    shell: false,
+  });
+
+  if (build.status !== 0 || !fs.existsSync(serverBundle)) {
+    const nodeMajor = Number(process.versions.node.split('.')[0] || 0);
+    if (nodeMajor >= 23 && fs.existsSync(serverTsEntry)) {
+      console.warn(
+        `[PictaBot] esbuild no disponible en este contenedor; ejecutando server.ts directamente con Node ${process.version}.`
+      );
+      useNativeTsFallback = true;
+    } else {
+      console.error('[PictaBot] Error compilando dist/server.js.');
+      process.exit(build.status || 1);
+    }
+  }
+}
+
 process.env.NODE_ENV = 'production';
 
-await import(pathToFileURL(serverBundle).href);
+if (useNativeTsFallback) {
+  await import(pathToFileURL(serverTsEntry).href);
+} else {
+  await import(pathToFileURL(serverBundle).href);
+}
