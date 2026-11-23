@@ -11,14 +11,11 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
-const inputArg = process.argv[2];
-if (!inputArg) {
-  console.error('Uso: node scripts/import-env-from-legacy.mjs <ruta_a_server.txt>');
-  process.exit(1);
-}
+const inputArg = process.argv[2] || 'server.txt';
 
 const sourcePath = path.resolve(process.cwd(), inputArg);
 if (!fs.existsSync(sourcePath)) {
+  console.error(`Uso: node scripts/import-env-from-legacy.mjs <ruta_a_server.txt>`);
   console.error(`No se encontro el archivo: ${sourcePath}`);
   process.exit(1);
 }
@@ -103,8 +100,8 @@ const envLines = [
   `PICTA_CHANNEL_ID=${detected.PICTA_CHANNEL_ID}`,
   `PICTA_CHANNEL_NAME=${detected.PICTA_CHANNEL_NAME}`,
   `TMDB_API_KEY=${detected.TMDB_API_KEY}`,
-  'PICTA_STATE_DIR=/app/data/bot_state',
-  'PICTA_SCRATCH_DIR=/app/data/scratch',
+  'PICTA_STATE_DIR=./data/bot_state',
+  'PICTA_SCRATCH_DIR=./data/scratch',
   'PICTA_DISK_BUDGET_GB=10',
   'MTPROTO_SAFE_PARALLEL_WORKERS=6',
   'MTPROTO_TCP_POOL_SIZE=6',

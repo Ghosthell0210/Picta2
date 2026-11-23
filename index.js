@@ -41,6 +41,27 @@ if (!fs.existsSync(serverBundle) || !fs.existsSync(distIndex)) {
   }
 }
 
+const envFile = path.join(rootDir, '.env');
+const legacyServerFile = path.join(rootDir, 'server.txt');
+const importScript = path.join(rootDir, 'scripts', 'import-env-from-legacy.mjs');
+
+if (fs.existsSync(legacyServerFile) && fs.existsSync(importScript) && !fs.existsSync(envFile)) {
+  console.log('[PictaBot] Detectado server.txt sin .env -> generando .env automaticamente...');
+  const imp = spawnSync(process.execPath, [importScript, legacyServerFile], {
+    cwd: rootDir,
+    stdio: 'inherit',
+    shell: false,
+  });
+  if (imp.status === 0 && fs.existsSync(envFile)) {
+    try {
+      fs.rmSync(legacyServerFile, { force: true });
+      console.log('[PictaBot] .env generado correctamente y server.txt eliminado por seguridad.');
+    } catch {
+      // Ignore removal error
+    }
+  }
+}
+
 process.env.NODE_ENV = 'production';
 
 await import(pathToFileURL(serverBundle).href);
