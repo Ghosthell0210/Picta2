@@ -2,6 +2,7 @@ import { GoogleGenAI, Type } from '@google/genai';
 import { spawn } from 'child_process';
 import fs from 'fs';
 import type { TmdbEnrichedCandidate } from '../shared/types.ts';
+import { loadProjectEnv } from './envLoader.ts';
 import { netlog } from './netlog.ts';
 
 const ALLOWED_IMAGE_HOSTS = new Set([
@@ -22,10 +23,59 @@ const TMDB_CACHE_TTL_MS = 15 * 60 * 1000;
 const tmdbCache = new Map<string, { expiresAt: number; items: TmdbEnrichedCandidate[] }>();
 
 let sharedGeminiClient: GoogleGenAI | null = null;
+let sharedGeminiKeyFingerprint = '';
+let lastGeminiErrorMessage = '';
+
+function cleanEnvSecret(raw?: string): string {
+  const trimmed = String(raw || '').trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2)
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+function resolveGeminiApiKey(): string {
+  let key = cleanEnvSecret(process.env.GEMINI_API_KEY) || cleanEnvSecret(process.env.GOOGLE_API_KEY);
+  if (!key) {
+    loadProjectEnv();
+    key = cleanEnvSecret(process.env.GEMINI_API_KEY) || cleanEnvSecret(process.env.GOOGLE_API_KEY);
+  }
+  return key;
+}
+
+function resolveGeminiModel(): string {
+  return cleanEnvSecret(process.env.GEMINI_MODEL) || 'gemini-4-hydrogen';
+}
+
+function formatGeminiError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err || 'Error desconocido');
+  // Never leak any API key token in error text
+  const sanitized = raw.replace(/AIza[0-9A-Za-z\-_]{20,}/g, '[API_KEY]').slice(0, 260);
+  if (/API_KEY_INVALID|API key not valid/i.test(sanitized)) {
+    return 'Clave GEMINI_API_KEY inválida o rechazada por Google AI (400 API_KEY_INVALID).';
+  }
+  if (/PERMISSION_DENIED|403/i.test(sanitized)) {
+    return 'Permiso denegado por Gemini API (403 PERMISSION_DENIED). Verifica permisos/región de la clave.';
+  }
+  if (/RESOURCE_EXHAUSTED|429/i.test(sanitized)) {
+    return 'Cuota de Gemini API agotada temporalmente (429 RESOURCE_EXHAUSTED).';
+  }
+  if (/NOT_FOUND|404/i.test(sanitized)) {
+    return `Modelo Gemini no encontrado (${resolveGeminiModel()} · 404 NOT_FOUND).`;
+  }
+  return sanitized;
+}
+
 function getGeminiClient(): GoogleGenAI | null {
-  const apiKey = (process.env.GEMINI_API_KEY || '').trim();
-  if (!apiKey) return null;
-  if (!sharedGeminiClient) {
+  const apiKey = resolveGeminiApiKey();
+  if (!apiKey) {
+    lastGeminiErrorMessage = 'GEMINI_API_KEY no encontrada en .env ni en las variables de entorno.';
+    return null;
+  }
+  if (!sharedGeminiClient || sharedGeminiKeyFingerprint !== apiKey) {
     sharedGeminiClient = new GoogleGenAI({
       apiKey,
       httpOptions: {
@@ -34,12 +84,17 @@ function getGeminiClient(): GoogleGenAI | null {
         },
       },
     });
+    sharedGeminiKeyFingerprint = apiKey;
   }
   return sharedGeminiClient;
 }
 
 export function isGeminiConfigured(): boolean {
-  return Boolean((process.env.GEMINI_API_KEY || '').trim());
+  return Boolean(resolveGeminiApiKey());
+}
+
+export function getLastGeminiError(): string {
+  return lastGeminiErrorMessage;
 }
 
 export function normalizeCmp(str: string): string {
@@ -393,7 +448,7 @@ export async function enrichMetadataWithGemini(params: {
       .join('\n');
 
     const response = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
+      model: resolveGeminiModel(),
       contents: prompt,
       config: {
         systemInstruction:
@@ -415,7 +470,10 @@ export async function enrichMetadataWithGemini(params: {
     });
 
     const raw = (response.text || '').trim();
-    if (!raw) return null;
+    if (!raw) {
+      lastGeminiErrorMessage = 'Gemini devolvió una respuesta vacía.';
+      return null;
+    }
     const parsed = JSON.parse(raw) as {
       title?: string;
       synopsis?: string;
@@ -429,6 +487,7 @@ export async function enrichMetadataWithGemini(params: {
       : '+16';
     const rawTip = Number(parsed.suggestedTipologia || 8);
     const suggestedTipologia = VALID_TIPOLOGIA_IDS.has(rawTip) ? rawTip : 8;
+    lastGeminiErrorMessage = '';
 
     return {
       title: String(parsed.title || params.title).trim(),
@@ -439,7 +498,9 @@ export async function enrichMetadataWithGemini(params: {
       suggestedTipologia,
     };
   } catch (err) {
-    netlog.warn('picta', `Gemini no disponible para enriquecimiento: ${err instanceof Error ? err.message : String(err)}`);
+    lastGeminiErrorMessage = formatGeminiError(err);
+    console.warn(`[PictaBot][Gemini] Error enriquecimiento: ${lastGeminiErrorMessage}`);
+    netlog.warn('picta', `Gemini no disponible para enriquecimiento: ${lastGeminiErrorMessage}`);
     return null;
   }
 }
@@ -466,7 +527,7 @@ export async function generateAiCommentReply(params: {
     ].join('\n');
 
     const response = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
+      model: resolveGeminiModel(),
       contents: prompt,
       config: {
         systemInstruction:
@@ -475,9 +536,16 @@ export async function generateAiCommentReply(params: {
     });
 
     const reply = (response.text || '').trim().replace(/^["']|["']$/g, '').slice(0, 450);
-    return reply || null;
+    if (!reply) {
+      lastGeminiErrorMessage = 'Gemini devolvió una sugerencia vacía.';
+      return null;
+    }
+    lastGeminiErrorMessage = '';
+    return reply;
   } catch (err) {
-    netlog.warn('picta', `Error generando respuesta IA para comentario: ${err instanceof Error ? err.message : String(err)}`);
+    lastGeminiErrorMessage = formatGeminiError(err);
+    console.warn(`[PictaBot][Gemini] Error respuesta comentario: ${lastGeminiErrorMessage}`);
+    netlog.warn('picta', `Error generando respuesta IA para comentario: ${lastGeminiErrorMessage}`);
     return null;
   }
 }

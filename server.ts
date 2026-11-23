@@ -1,5 +1,6 @@
-import 'dotenv/config';
+import './src/server/envLoader.ts';
 import express from 'express';
+import { isGeminiConfigured } from './src/server/mediaIntelligence.ts';
 import { netlog } from './src/server/netlog.ts';
 import { stateStore } from './src/server/stateStore.ts';
 import { telegramRuntime } from './src/server/telegramRuntime.ts';
@@ -24,6 +25,7 @@ async function startHeadlessBotServer() {
       pollingActive: t.telegram.pollingActive,
       webhookActive: t.telegram.webhookActive,
       mtprotoConnected: t.mtproto.connected,
+      geminiConfigured: isGeminiConfigured(),
       queueActive: activeJobs,
       memoryRssMb: Math.round(process.memoryUsage().rss / (1024 * 1024)),
     });
@@ -66,6 +68,9 @@ async function startHeadlessBotServer() {
       `[PictaBot] Bot headless activo en puerto ${port} (${process.env.NODE_ENV || 'development'} · RAM ${Math.round(
         process.memoryUsage().rss / (1024 * 1024)
       )} MB)`
+    );
+    console.log(
+      `[PictaBot] IA Gemini: ${isGeminiConfigured() ? 'ACTIVA' : 'SIN CLAVE (define GEMINI_API_KEY en .env o variables del servidor)'}`
     );
     void telegramRuntime.start();
   });

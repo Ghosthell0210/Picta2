@@ -21,6 +21,7 @@ import {
   buildSerieTitleOptions,
   enrichMetadataWithGemini,
   generateAiCommentReply,
+  getLastGeminiError,
   isGeminiConfigured,
   searchTmdbRichCandidates,
 } from './mediaIntelligence.ts';
@@ -1687,7 +1688,8 @@ export class TelegramBotRuntime {
           if (!item) return;
           const aiRes = await enrichMetadataWithGemini({ title: item.nombre, existingOverview: item.descripcion });
           if (!aiRes) {
-            await tgSendMessage(chatId, '⚠️ Gemini IA no disponible (verifica GEMINI_API_KEY en el servidor).');
+            const reason = getLastGeminiError() || 'verifica GEMINI_API_KEY en .env o variables del servidor.';
+            await tgSendMessage(chatId, `⚠️ <b>Gemini IA no disponible:</b> ${escHtml(reason)}`);
             return;
           }
           await pictaService.patchPublication(ctx, vid, {
@@ -1867,7 +1869,8 @@ export class TelegramBotRuntime {
             isRequest: target.isLikelyRequest,
           });
           if (!suggestion) {
-            await tgSendMessage(chatId, '⚠️ Gemini IA no disponible (verifica GEMINI_API_KEY).');
+            const reason = getLastGeminiError() || 'verifica GEMINI_API_KEY en .env o variables del servidor.';
+            await tgSendMessage(chatId, `⚠️ <b>Gemini IA no disponible:</b> ${escHtml(reason)}`);
             return;
           }
           const draftKey = `${userId}:${cid}`;
@@ -2326,7 +2329,8 @@ export class TelegramBotRuntime {
             existingOverview: draft.description,
           });
           if (!aiRes) {
-            await tgSendMessage(chatId, '⚠️ Gemini IA no disponible (verifica GEMINI_API_KEY en el servidor).');
+            const reason = getLastGeminiError() || 'verifica GEMINI_API_KEY en .env o variables del servidor.';
+            await tgSendMessage(chatId, `⚠️ <b>Gemini IA no disponible:</b> ${escHtml(reason)}`);
             return;
           }
           draft.title = aiRes.title;

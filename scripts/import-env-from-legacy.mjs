@@ -100,8 +100,8 @@ const detected = {
   PICTA_CHANNEL_ID: extractValue(['PICTA_CHANNEL_ID', 'DEFAULT_CHANNEL_ID', 'CHANNEL_ID']) || '36319',
   PICTA_CHANNEL_NAME: extractValue(['PICTA_CHANNEL_NAME', 'DEFAULT_CHANNEL_NAME', 'CHANNEL_NAME']) || 'Multiverso Visual',
   TMDB_API_KEY: extractValue(['PICTA_TMDB_API_KEY', 'TMDB_API_KEY', 'TMDB_KEY']),
+  GEMINI_API_KEY: extractValue(['GEMINI_API_KEY', 'GOOGLE_API_KEY']),
   VAULT_ENCRYPTION_KEY: extractValue(['VAULT_ENCRYPTION_KEY']) || crypto.randomBytes(24).toString('hex'),
-  ADMIN_DASHBOARD_PASSCODE: extractValue(['ADMIN_DASHBOARD_PASSCODE']) || crypto.randomBytes(12).toString('hex'),
 };
 
 const envLines = [
@@ -116,7 +116,6 @@ const envLines = [
   `TELEGRAM_MTPROTO_SESSION=${detected.TELEGRAM_MTPROTO_SESSION}`,
   `TELEGRAM_VAULT_CHAT_ID=${detected.TELEGRAM_VAULT_CHAT_ID}`,
   `VAULT_ENCRYPTION_KEY=${detected.VAULT_ENCRYPTION_KEY}`,
-  `ADMIN_DASHBOARD_PASSCODE=${detected.ADMIN_DASHBOARD_PASSCODE}`,
   `PICTA_USERNAME=${detected.PICTA_USERNAME}`,
   `PICTA_PASSWORD=${detected.PICTA_PASSWORD}`,
   `PICTA_CLIENT_ID=${detected.PICTA_CLIENT_ID}`,
@@ -124,6 +123,7 @@ const envLines = [
   `PICTA_CHANNEL_ID=${detected.PICTA_CHANNEL_ID}`,
   `PICTA_CHANNEL_NAME=${detected.PICTA_CHANNEL_NAME}`,
   `TMDB_API_KEY=${detected.TMDB_API_KEY}`,
+  `GEMINI_API_KEY=${detected.GEMINI_API_KEY}`,
   'PICTA_STATE_DIR=./data/bot_state',
   'PICTA_SCRATCH_DIR=./data/scratch',
   'PICTA_DISK_BUDGET_GB=10',
@@ -141,4 +141,3 @@ console.log('Resumen de campos detectados:');
 for (const [k, v] of Object.entries(detected)) {
   console.log(`  - ${k}: ${v ? 'OK' : 'VACIO (completar manualmente si aplica)'}`);
 }
-console.log('\nClave generada para el panel web (ADMIN_DASHBOARD_PASSCODE): guardada en tu .env.');
