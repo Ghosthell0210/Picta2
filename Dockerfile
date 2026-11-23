@@ -7,6 +7,7 @@ WORKDIR /app
 
 COPY package.json ./
 COPY package-lock.json* ./
+COPY .npmrc* ./
 RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
 COPY . .
@@ -36,11 +37,11 @@ ENV MAX_PREFETCH_LOOKAHEAD=1
 
 COPY package.json ./
 COPY package-lock.json* ./
+COPY .npmrc* ./
 RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi \
   && npm cache clean --force
 
 COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/server.js ./server.js
 
 # Directorios persistentes fuera de /tmp con permisos compatibles con contenedores Altare
 RUN mkdir -p /app/data/bot_state /app/data/scratch && chmod -R 777 /app/data
@@ -52,4 +53,4 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || process.env.SERVER_PORT || 3000) + '/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
-CMD ["node", "server.js"]
+CMD ["node", "dist/server.js"]
