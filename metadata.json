@@ -1,0 +1,6 @@
+{
+  "name": "PictaBot Altare Edition",
+  "description": "Bot 24/7 de Telegram y Picta con motor MTProto paralelo, ensamblador /unir para disco persistente de 10 GB, respaldo cifrado en Telegram Cloud Vault y consola de operaciones para despliegue en Altare.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

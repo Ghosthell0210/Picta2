@@ -1,0 +1,18 @@
+services:
+  pictabot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pictabot-altare
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: ${PORT:-3000}
+      PICTA_STATE_DIR: /app/data/bot_state
+      PICTA_SCRATCH_DIR: /app/data/scratch
+    ports:
+      - "${PORT:-3000}:${PORT:-3000}"
+    volumes:
+      - ./data:/app/data
