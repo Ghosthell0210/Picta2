@@ -30,12 +30,14 @@ function extractValue(names, fallbackRegexes = []) {
   for (const name of names) {
     const escaped = escapeRegExp(name);
     const patterns = [
-      // const NAME = process.env.X || 'value'
-      new RegExp(`\\b${escaped}\\b\\s*=[^\\n;]*\\|\\|\\s*['"\`]([^'"\`\\n]+)['"\`]`),
+      // const NAME = process.env.X || 'value'  OR  propName: process.env.X || 'value'
+      new RegExp(`\\b${escaped}\\b\\s*[:=][^\\n;,]*\\|\\|\\s*['"\`]([^'"\`\\n]+)['"\`]`),
+      // process.env.NAME || 'value'
+      new RegExp(`process\\.env\\.${escaped}\\s*\\|\\|\\s*['"\`]([^'"\`\\n]+)['"\`]`),
       // const NAME = 'value'  OR  NAME: 'value'
       new RegExp(`\\b${escaped}\\b\\s*[:=]\\s*['"\`]([^'"\`\\n]+)['"\`]`),
-      // const NAME = Number(process.env.X || 12345) OR const NAME = 12345
-      new RegExp(`\\b${escaped}\\b\\s*=[^\\n;]*\\|\\|\\s*(\\d{4,20})\\b`),
+      // const NAME = Number(process.env.X || 12345) OR propName: process.env.X || 12345
+      new RegExp(`\\b${escaped}\\b\\s*[:=][^\\n;,]*\\|\\|\\s*(\\d{4,20})\\b`),
       new RegExp(`\\b${escaped}\\b\\s*[:=]\\s*(\\d{4,20})\\b`),
       // KEY=value style
       new RegExp(`^\\s*${escaped}\\s*=\\s*([^\\s#\\n]+)`, 'm'),
@@ -56,7 +58,7 @@ function extractValue(names, fallbackRegexes = []) {
 
 const detected = {
   TELEGRAM_BOT_TOKEN: extractValue(
-    ['TELEGRAM_BOT_TOKEN', 'BOT_TOKEN', 'TELEGRAM_TOKEN', 'TOKEN'],
+    ['TELEGRAM_BOT_TOKEN', 'telegramBotToken', 'BOT_TOKEN', 'TELEGRAM_TOKEN', 'TOKEN'],
     [/['"`](\d{7,12}:[A-Za-z0-9_-]{30,50})['"`]/]
   ),
   MASTER_ADMIN_CHAT_ID: extractValue([
@@ -67,8 +69,8 @@ const detected = {
     'OWNER_ID',
     'ADMIN_TELEGRAM_IDS',
   ]),
-  TELEGRAM_API_ID: extractValue(['TELEGRAM_API_ID', 'MTPROTO_API_ID', 'API_ID', 'TG_API_ID']),
-  TELEGRAM_API_HASH: extractValue(['TELEGRAM_API_HASH', 'MTPROTO_API_HASH', 'API_HASH', 'TG_API_HASH']),
+  TELEGRAM_API_ID: extractValue(['TELEGRAM_API_ID', 'telegramApiId', 'MTPROTO_API_ID', 'API_ID', 'TG_API_ID']),
+  TELEGRAM_API_HASH: extractValue(['TELEGRAM_API_HASH', 'telegramApiHash', 'MTPROTO_API_HASH', 'API_HASH', 'TG_API_HASH']),
   TELEGRAM_MTPROTO_SESSION: extractValue([
     'TELEGRAM_MTPROTO_SESSION',
     'MTPROTO_SESSION',
@@ -79,6 +81,7 @@ const detected = {
   TELEGRAM_VAULT_CHAT_ID: extractValue(['TELEGRAM_VAULT_CHAT_ID', 'VAULT_CHAT_ID', 'CLOUD_VAULT_CHAT_ID']),
   PICTA_USERNAME: extractValue([
     'PICTA_USERNAME',
+    'pictaUsername',
     'PICTA_DEFAULT_USERNAME',
     'DEFAULT_PICTA_USERNAME',
     'PICTA_USER',
@@ -86,16 +89,17 @@ const detected = {
   ]),
   PICTA_PASSWORD: extractValue([
     'PICTA_PASSWORD',
+    'pictaPassword',
     'PICTA_DEFAULT_PASSWORD',
     'DEFAULT_PICTA_PASSWORD',
     'PICTA_PASS',
     'DEFAULT_PICTA_PASS',
   ]),
-  PICTA_CLIENT_ID: extractValue(['PICTA_CLIENT_ID', 'CLIENT_ID', 'OAUTH_CLIENT_ID']),
+  PICTA_CLIENT_ID: extractValue(['PICTA_OFFICIAL_CLIENT_ID', 'PICTA_CLIENT_ID', 'pictaClientId', 'CLIENT_ID', 'OAUTH_CLIENT_ID']),
   PICTA_AES_KEY: extractValue(['PICTA_AES_KEY', 'AES_KEY', 'PICTA_CRYPTO_KEY']),
   PICTA_CHANNEL_ID: extractValue(['PICTA_CHANNEL_ID', 'DEFAULT_CHANNEL_ID', 'CHANNEL_ID']) || '36319',
   PICTA_CHANNEL_NAME: extractValue(['PICTA_CHANNEL_NAME', 'DEFAULT_CHANNEL_NAME', 'CHANNEL_NAME']) || 'Multiverso Visual',
-  TMDB_API_KEY: extractValue(['TMDB_API_KEY', 'TMDB_KEY']),
+  TMDB_API_KEY: extractValue(['PICTA_TMDB_API_KEY', 'TMDB_API_KEY', 'TMDB_KEY']),
   VAULT_ENCRYPTION_KEY: extractValue(['VAULT_ENCRYPTION_KEY']) || crypto.randomBytes(24).toString('hex'),
   ADMIN_DASHBOARD_PASSCODE: extractValue(['ADMIN_DASHBOARD_PASSCODE']) || crypto.randomBytes(12).toString('hex'),
 };

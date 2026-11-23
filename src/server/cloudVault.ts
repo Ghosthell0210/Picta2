@@ -420,8 +420,8 @@ export async function restoreCloudStateFromTelegramCommands(): Promise<{
       stateStore.importBundle(parsed);
     }
     if (iaText) {
-      const parsedIa = JSON.parse(iaText) as { session?: string; mtprotoSessionString?: string };
-      const sess = (parsedIa.session || parsedIa.mtprotoSessionString || '').trim();
+      const parsedIa = JSON.parse(iaText) as { m?: string; session?: string; mtprotoSessionString?: string };
+      const sess = (parsedIa.m || parsedIa.session || parsedIa.mtprotoSessionString || '').trim();
       if (sess.length > 10) {
         stateStore.saveMtprotoSession(sess);
         restoredMtproto = true;
