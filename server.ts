@@ -344,11 +344,19 @@ function sanitizeLeakedUserSession(session, masterChannelId) {
 function normalizePictaChannelDetails(raw, fallbackId, fallbackName, fallbackClasificacion = "18+") {
   const src = raw && typeof raw === "object" ? raw : {};
   const id = Number(src.id || fallbackId || 0);
-  const nombre = String(src.nombre || src.name || fallbackName || `Canal #${id}`).trim();
-  const alias = String(src.alias || "").trim();
-  const descripcion = String(src.descripcion || src.description || "").trim();
+  const nombre = String(src.nombre || src.name || fallbackName || `Canal #${id}`).replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
+  const alias = String(src.alias || "").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
+  const descripcion = String(src.descripcion || src.description || "").replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\r\n/g, "\n").trim();
   const clasificacion = String(src.clasificacion || fallbackClasificacion || "18+").trim();
   const slugUrl = src.slug_url ? String(src.slug_url).trim() : void 0;
+  const subsCount = Math.max(
+    Number(src.cantidad_suscriptores || 0),
+    Number(src.cantidad_suscripciones || 0)
+  );
+  const pubsCount = Math.max(
+    Number(src.cantidad_publicaciones || 0),
+    Number(src.publicaciones_count || 0)
+  );
   return {
     id,
     nombre,
@@ -360,10 +368,15 @@ function normalizePictaChannelDetails(raw, fallbackId, fallbackName, fallbackCla
     publicado: src.publicado !== void 0 ? Boolean(src.publicado) : src.visible !== void 0 ? Boolean(src.visible) : true,
     recibir_donacion: src.recibir_donacion !== void 0 ? Boolean(src.recibir_donacion) : Boolean(src.donacion ?? src.donar),
     donacion: src.donacion !== void 0 ? Boolean(src.donacion) : Boolean(src.recibir_donacion ?? src.donar),
-    cantidad_suscriptores: Number(src.cantidad_suscriptores || 0),
-    cantidad_publicaciones: Number(src.cantidad_publicaciones || 0),
+    cantidad_suscriptores: subsCount,
+    cantidad_publicaciones: pubsCount,
     ...src.url_avatar ? { url_avatar: String(src.url_avatar) } : {},
-    ...src.url_imagen ? { url_imagen: String(src.url_imagen) } : {}
+    ...src.url_imagen ? { url_imagen: String(src.url_imagen) } : {},
+    ...src.propietario !== void 0 ? { propietario: src.propietario } : {},
+    ...src.usuario !== void 0 ? { usuario: src.usuario } : {},
+    ...Array.isArray(src.usuarios_asociados) ? { usuarios_asociados: src.usuarios_asociados } : {},
+    ...Array.isArray(src.usuarios_asociados_ids) ? { usuarios_asociados_ids: src.usuarios_asociados_ids } : {},
+    ...Array.isArray(src.usuarios_asociados_nombres) ? { usuarios_asociados_nombres: src.usuarios_asociados_nombres } : {}
   };
 }
 function isGenericAutoSynopsis(synopsis, rawCaption) {
@@ -1588,14 +1601,52 @@ function parsePictaNextPageUrl(baseUrl, nextVal, currentPage) {
   return null;
 }
 function extractPictaResumenMetrics(raw) {
-  const src = Array.isArray(raw) ? raw[0] || {} : raw?.results?.[0] || raw || {};
+  const root = Array.isArray(raw) ? raw[0] || {} : raw?.results?.[0] || raw || {};
+  const nacPubs = root?.nacional?.publicaciones;
+  const intPubs = root?.internacional?.publicaciones;
+  if (nacPubs || intPubs) {
+    const n = nacPubs && typeof nacPubs === "object" ? nacPubs : {};
+    const i = intPubs && typeof intPubs === "object" ? intPubs : {};
+    const mergeTopList = (listA, listB) => {
+      const byName = /* @__PURE__ */ new Map();
+      for (const item of [...Array.isArray(listA) ? listA : [], ...Array.isArray(listB) ? listB : []]) {
+        const name = String(item?.nombre || "").trim();
+        const qty = Number(item?.cantidad || 0);
+        if (!name || qty <= 0) continue;
+        byName.set(name, (byName.get(name) || 0) + qty);
+      }
+      return Array.from(byName.entries()).map(([nombre, cantidad]) => ({ nombre, cantidad }));
+    };
+    return {
+      publicadas: (Number(n.publicadas || 0) || 0) + (Number(i.publicadas || 0) || 0),
+      no_publicadas: (Number(n.no_publicadas || 0) || 0) + (Number(i.no_publicadas || 0) || 0),
+      eliminadas: (Number(n.eliminadas || 0) || 0) + (Number(i.eliminadas || 0) || 0),
+      views: (Number(n.visitas ?? n.cantidad_visitas ?? n.views ?? 0) || 0) + (Number(i.visitas ?? i.cantidad_visitas ?? i.views ?? 0) || 0),
+      plays: (Number(n.reproducciones ?? n.cantidad_reproducciones ?? n.plays ?? 0) || 0) + (Number(i.reproducciones ?? i.cantidad_reproducciones ?? i.plays ?? 0) || 0),
+      likes: (Number(n.likes ?? n.me_gusta ?? n.cantidad_me_gusta ?? 0) || 0) + (Number(i.likes ?? i.me_gusta ?? i.cantidad_me_gusta ?? 0) || 0),
+      dislikes: (Number(n.dislikes ?? n.no_me_gusta ?? 0) || 0) + (Number(i.dislikes ?? i.no_me_gusta ?? 0) || 0),
+      downloads: (Number(n.descargas ?? n.cantidad_descargas ?? n.downloads ?? 0) || 0) + (Number(i.descargas ?? i.cantidad_descargas ?? i.downloads ?? 0) || 0),
+      comments: (Number(n.comentarios ?? n.cantidad_comentarios ?? n.comments ?? 0) || 0) + (Number(i.comentarios ?? i.cantidad_comentarios ?? i.comments ?? 0) || 0),
+      mas_descargadas: mergeTopList(n.mas_descargadas, i.mas_descargadas),
+      mas_vistas: mergeTopList(n.mas_vistas, i.mas_vistas),
+      mas_reproducidas: mergeTopList(n.mas_reproducidas, i.mas_reproducidas),
+      mas_likes: mergeTopList(n.mas_likes, i.mas_likes),
+      mas_comentadas: mergeTopList(n.mas_comentadas, i.mas_comentadas)
+    };
+  }
+  const src = root?.publicaciones && typeof root.publicaciones === "object" ? root.publicaciones : root;
   return {
     publicadas: Number(src.publicadas ?? src.cantidad_publicaciones ?? src.total ?? src.count ?? 0) || 0,
     views: Number(src.visitas ?? src.cantidad_visitas ?? src.views ?? 0) || 0,
     plays: Number(src.reproducciones ?? src.cantidad_reproducciones ?? src.plays ?? 0) || 0,
-    likes: Number(src.me_gusta ?? src.cantidad_me_gusta ?? src.likes ?? 0) || 0,
+    likes: Number(src.likes ?? src.me_gusta ?? src.cantidad_me_gusta ?? 0) || 0,
     downloads: Number(src.descargas ?? src.cantidad_descargas ?? src.downloads ?? 0) || 0,
-    comments: Number(src.comentarios ?? src.cantidad_comentarios ?? src.comments ?? 0) || 0
+    comments: Number(src.comentarios ?? src.cantidad_comentarios ?? src.comments ?? 0) || 0,
+    mas_descargadas: Array.isArray(src.mas_descargadas) ? src.mas_descargadas : [],
+    mas_vistas: Array.isArray(src.mas_vistas) ? src.mas_vistas : [],
+    mas_reproducidas: Array.isArray(src.mas_reproducidas) ? src.mas_reproducidas : [],
+    mas_likes: Array.isArray(src.mas_likes) ? src.mas_likes : [],
+    mas_comentadas: Array.isArray(src.mas_comentadas) ? src.mas_comentadas : []
   };
 }
 function mergeAndDedupeChannelPublications(batches, channelId) {
@@ -1631,7 +1682,24 @@ function computeGlobalChannelStats(publications, opts) {
   let hiddenOrPendingCount = 0;
   let topViewed = void 0;
   let topLiked = void 0;
+  const normTitle = (t) => String(t || "").replace(/[\u200B-\u200D\uFEFF]/g, "").trim().toLowerCase();
+  const topDownloadsByTitle = /* @__PURE__ */ new Map();
+  for (const summary of [opts?.webAdminToday, opts?.webAdminLast7d, opts?.webAdminLast30d, opts?.webAdminAllTime]) {
+    for (const item of summary?.mas_descargadas || []) {
+      const key = normTitle(item?.nombre);
+      const qty = Number(item?.cantidad || 0);
+      if (key && qty > (topDownloadsByTitle.get(key) || 0)) {
+        topDownloadsByTitle.set(key, qty);
+      }
+    }
+  }
   for (const p of publications || []) {
+    if (Number(p?.cantidad_descargas || 0) === 0 && topDownloadsByTitle.size > 0) {
+      const matchedDl = topDownloadsByTitle.get(normTitle(p?.nombre));
+      if (matchedDl && matchedDl > 0) {
+        p.cantidad_descargas = matchedDl;
+      }
+    }
     const views = Number(p?.cantidad_visitas || 0);
     const plays = Number(p?.cantidad_reproducciones || 0);
     const likes = Number(p?.cantidad_me_gusta || 0);
@@ -1659,6 +1727,14 @@ function computeGlobalChannelStats(publications, opts) {
     if (pubDate && pubDate === opts.cubaTodayStr) {
       publishedToday++;
     }
+  }
+  const allTime = opts?.webAdminAllTime;
+  if (allTime) {
+    totalViews = Math.max(totalViews, Number(allTime.views || 0));
+    totalPlays = Math.max(totalPlays, Number(allTime.plays || 0));
+    totalLikes = Math.max(totalLikes, Number(allTime.likes || 0));
+    totalDownloads = Math.max(totalDownloads, Number(allTime.downloads || 0));
+    totalComments = Math.max(totalComments, Number(allTime.comments || 0));
   }
   const fetchedVideos = publications.length;
   const reportedTotal = Number(opts.reportedApiTotalCount || 0);
@@ -11415,64 +11491,125 @@ async function fetchPictaChannelDetails(chatId) {
   }
   const token = await context.accessTokenPromise;
   const channelId = context.channelId;
-  let res = await fetchPictaWithRetry(
-    `https://api.picta.cu/v1/canal/${encodeURIComponent(channelId)}/`,
-    {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Origin: "https://admin.picta.cu",
-        Referer: "https://admin.picta.cu/"
-      }
-    }
-  );
-  if (!res.ok) {
-    res = await fetchPictaWithRetry(
-      `https://api.picta.cu/v2/canal/${encodeURIComponent(channelId)}/`,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Origin: "https://admin.picta.cu",
-          Referer: "https://admin.picta.cu/"
-        }
-      }
-    );
-  }
-  if (!res.ok) {
-    res = await fetchPictaWithRetry(
-      `https://api.picta.cu/v2/canal/?id=${encodeURIComponent(channelId)}`,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Origin: "https://admin.picta.cu",
-          Referer: "https://admin.picta.cu/"
-        }
-      }
-    );
-  }
-  if (!res.ok) {
-    throw new Error(`Error HTTP ${res.status} al obtener detalles del canal #${channelId}`);
-  }
-  const rawText = (await res.text()).trim();
-  let parsed = {};
-  try {
-    parsed = JSON.parse(rawText);
-  } catch {
+  const authHeaders = {
+    Authorization: `Bearer ${token}`,
+    Origin: "https://admin.picta.cu",
+    Referer: "https://admin.picta.cu/"
+  };
+  const parsePictaBody = async (res) => {
+    if (!res || !res.ok) return null;
+    const rawText = (await res.text().catch(() => "")).trim();
+    if (!rawText) return null;
     try {
-      const cleanEncrypted = rawText.replace(/^"|"$/g, "");
-      const decipher = crypto.createDecipheriv(
-        "aes-128-ecb",
-        Buffer.from(PICTA_AES_KEY, "utf8"),
-        null
-      );
-      let decrypted = decipher.update(cleanEncrypted, "base64", "utf8");
-      decrypted += decipher.final("utf8");
-      parsed = JSON.parse(decrypted);
+      return JSON.parse(rawText);
     } catch {
-      parsed = {};
+      try {
+        const cleanEncrypted = rawText.replace(/^"|"$/g, "");
+        const decipher = crypto.createDecipheriv(
+          "aes-128-ecb",
+          Buffer.from(PICTA_AES_KEY, "utf8"),
+          null
+        );
+        let decrypted = decipher.update(cleanEncrypted, "base64", "utf8");
+        decrypted += decipher.final("utf8");
+        return JSON.parse(decrypted);
+      } catch {
+        return null;
+      }
+    }
+  };
+  const [directV1Data, subData, pubData] = await Promise.all([
+    fetchPictaWithRetry(`https://api.picta.cu/v1/canal/${encodeURIComponent(channelId)}/`, { headers: authHeaders })
+      .then(parsePictaBody)
+      .catch(() => null),
+    fetchPictaWithRetry(`https://api.picta.cu/v2/suscripcion/?canal=${encodeURIComponent(channelId)}&page_size=1`, { headers: authHeaders })
+      .then(parsePictaBody)
+      .catch(() => null),
+    fetchPictaWithRetry(`https://api.picta.cu/v2/publicacion/?canal_id=${encodeURIComponent(channelId)}&page_size=1`, { headers: authHeaders })
+      .then(parsePictaBody)
+      .catch(() => null)
+  ]);
+  const validDirectObj = directV1Data && typeof directV1Data === "object" && Number(directV1Data.id) === Number(channelId)
+    ? directV1Data
+    : null;
+  const subCanal = subData?.results?.[0]?.canal && Number(subData.results[0].canal.id) === Number(channelId)
+    ? subData.results[0].canal
+    : null;
+  const pubCanal = pubData?.results?.[0]?.canal && Number(pubData.results[0].canal.id) === Number(channelId)
+    ? pubData.results[0].canal
+    : null;
+  const discoveredSlug = String(
+    validDirectObj?.slug_url || pubCanal?.slug_url || subCanal?.slug_url || ""
+  ).trim();
+  let v1SlugObj = null;
+  if (discoveredSlug) {
+    const slugListData = await fetchPictaWithRetry(
+      `https://api.picta.cu/v1/canal/?slug_url=${encodeURIComponent(discoveredSlug)}`,
+      { headers: authHeaders }
+    )
+      .then(parsePictaBody)
+      .catch(() => null);
+    const slugResults = Array.isArray(slugListData)
+      ? slugListData
+      : Array.isArray(slugListData?.results)
+        ? slugListData.results
+        : [];
+    v1SlugObj = slugResults.find((c) => Number(c?.id) === Number(channelId)) || slugResults[0] || null;
+  }
+  if (!v1SlugObj && !validDirectObj && !pubCanal && !subCanal) {
+    const searchName = String(context.channelName || "").trim();
+    if (searchName) {
+      const searchData = await fetchPictaWithRetry(
+        `https://api.picta.cu/v1/canal/?nombre=${encodeURIComponent(searchName)}`,
+        { headers: authHeaders }
+      )
+        .then(parsePictaBody)
+        .catch(() => null);
+      const searchResults = Array.isArray(searchData)
+        ? searchData
+        : Array.isArray(searchData?.results)
+          ? searchData.results
+          : [];
+      v1SlugObj = searchResults.find((c) => Number(c?.id) === Number(channelId)) || null;
     }
   }
+  const liveSubsCount = Math.max(
+    typeof subData?.count === "number" ? Number(subData.count) : 0,
+    Number(pubCanal?.cantidad_suscripciones || pubCanal?.cantidad_suscriptores || 0),
+    Number(subCanal?.cantidad_suscripciones || subCanal?.cantidad_suscriptores || 0),
+    Number(v1SlugObj?.cantidad_suscripciones || v1SlugObj?.cantidad_suscriptores || 0),
+    Number(validDirectObj?.cantidad_suscripciones || validDirectObj?.cantidad_suscriptores || 0)
+  );
+  const livePubsCount = Math.max(
+    typeof pubData?.count === "number" ? Number(pubData.count) : 0,
+    Number(v1SlugObj?.cantidad_publicaciones || 0),
+    Number(validDirectObj?.cantidad_publicaciones || 0)
+  );
+  const assocIds = Array.isArray(v1SlugObj?.usuarios_asociados_ids) && v1SlugObj.usuarios_asociados_ids.length > 0
+    ? v1SlugObj.usuarios_asociados_ids
+    : Array.isArray(pubCanal?.usuarios_asociados)
+      ? pubCanal.usuarios_asociados.map((u) => typeof u === "object" && u ? Number(u.id || u.user_id || 0) : Number(u || 0)).filter((n) => n > 0)
+      : Array.isArray(subCanal?.usuarios_asociados)
+        ? subCanal.usuarios_asociados.map((u) => typeof u === "object" && u ? Number(u.id || u.user_id || 0) : Number(u || 0)).filter((n) => n > 0)
+        : [];
+  const assocNames = Array.isArray(v1SlugObj?.usuarios_asociados) && v1SlugObj.usuarios_asociados.every((x) => typeof x === "string")
+    ? v1SlugObj.usuarios_asociados
+    : [];
+  const mergedRaw = {
+    ...subCanal || {},
+    ...pubCanal || {},
+    ...v1SlugObj || {},
+    ...validDirectObj || {},
+    id: Number(channelId),
+    ...discoveredSlug ? { slug_url: discoveredSlug } : {},
+    cantidad_suscriptores: liveSubsCount,
+    cantidad_suscripciones: liveSubsCount,
+    cantidad_publicaciones: livePubsCount,
+    ...assocIds.length > 0 ? { usuarios_asociados_ids: assocIds } : {},
+    ...assocNames.length > 0 ? { usuarios_asociados_nombres: assocNames } : {}
+  };
   const details = normalizePictaChannelDetails(
-    parsed,
+    mergedRaw,
     channelId,
     context.channelName,
     botConfig.pictaClasificacion || "18+"
@@ -12927,6 +13064,7 @@ async function fetchChannelCollaboratorsInPicta(chatId) {
   const session = userSessions.get(effectiveChatId);
   let ownerId = isMaster ? 212033 : Number(session?.userId || 0);
   let assocRaw = ownerId > 0 ? [ownerId] : [];
+  const apiUsernameById = /* @__PURE__ */ new Map();
   if (res.ok) {
     const chObj = await res.json().catch(() => ({}));
     const fetchedOwner = Number(
@@ -12938,8 +13076,38 @@ async function fetchChannelCollaboratorsInPicta(chatId) {
     if (Array.isArray(chObj?.usuarios_asociados)) {
       assocRaw = chObj.usuarios_asociados;
     }
+  } else {
+    const fallbackDetails = await fetchPictaChannelDetails(effectiveChatId).catch(() => null);
+    if (fallbackDetails) {
+      const fetchedOwner = Number(
+        typeof fallbackDetails?.propietario === "object" && fallbackDetails.propietario
+          ? fallbackDetails.propietario?.id ?? fallbackDetails.propietario?.user_id
+          : fallbackDetails?.propietario || ownerId
+      );
+      if (Number.isFinite(fetchedOwner) && fetchedOwner > 0) {
+        ownerId = fetchedOwner;
+      }
+      if (Array.isArray(fallbackDetails.usuarios_asociados_ids) && fallbackDetails.usuarios_asociados_ids.length > 0) {
+        assocRaw = fallbackDetails.usuarios_asociados_ids;
+        const names = Array.isArray(fallbackDetails.usuarios_asociados_nombres)
+          ? fallbackDetails.usuarios_asociados_nombres
+          : [];
+        fallbackDetails.usuarios_asociados_ids.forEach((uid, idx) => {
+          const numId = Number(uid);
+          const uname = String(names[idx] || "").trim();
+          if (numId > 0 && uname) {
+            apiUsernameById.set(numId, uname);
+          }
+        });
+      } else if (Array.isArray(fallbackDetails.usuarios_asociados) && fallbackDetails.usuarios_asociados.length > 0) {
+        assocRaw = fallbackDetails.usuarios_asociados;
+      }
+    }
   }
   const knownLabels = /* @__PURE__ */ new Map();
+  for (const [uid, uname] of apiUsernameById.entries()) {
+    knownLabels.set(uid, `@${uname}${uid === ownerId ? " (Propietario)" : ""}`);
+  }
   if (isMaster) {
     knownLabels.set(212033, "@Ghosthell (+5356942234 \xB7 Propietario)");
     knownLabels.set(994913, "@Ghost0210Picta (+5354684486 \xB7 Pool)");
@@ -15931,7 +16099,13 @@ async function fetchPictaChannelCatalogSnapshot(chatId, forceRefresh = false) {
   const quotaUsedToday = isMaster ? (quotaSettings.seriesUploadedToday || 0) + (quotaSettings.otherUploadedToday || 0) : transferJobs.filter(
     (j) => j.telegramChatId === effectiveChatId && j.stage === "completed" && toCubaDateStr(j.updatedAt || j.createdAt) === cubaTodayStr
   ).length;
-  const channelSubscribers = Number(channelDetails?.cantidad_suscriptores || 0);
+  const pubCanalSubs = Number(
+    publications[0]?.canal?.cantidad_suscripciones || publications[0]?.canal?.cantidad_suscriptores || 0
+  );
+  const channelSubscribers = Math.max(
+    Number(channelDetails?.cantidad_suscriptores || 0),
+    pubCanalSubs
+  );
   const globalStats = computeGlobalChannelStats(publications, {
     reportedApiTotalCount,
     cubaTodayStr,
@@ -15963,12 +16137,24 @@ async function fetchSinglePictaPublicationDirect(pubId, chatId) {
     const context = getEffectivePictaContext(effectiveChatId);
     if (!context.isLinked) return null;
     const token = await context.accessTokenPromise;
-    const res = await fetchPictaWithRetry(`https://api.picta.cu/v1/publicacion/${pubId}/`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Origin: "https://admin.picta.cu",
-        Referer: "https://admin.picta.cu/"
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      Origin: "https://admin.picta.cu",
+      Referer: "https://admin.picta.cu/"
+    };
+    const v2Res = await fetchPictaWithRetry(
+      `https://api.picta.cu/v2/publicacion/?id=${encodeURIComponent(String(pubId))}`,
+      { headers }
+    );
+    if (v2Res.ok) {
+      const v2Data = await v2Res.json().catch(() => null);
+      const item = Array.isArray(v2Data?.results) ? v2Data.results[0] : v2Data;
+      if (item && Number(item.id) === Number(pubId)) {
+        return item;
       }
+    }
+    const res = await fetchPictaWithRetry(`https://api.picta.cu/v1/publicacion/${pubId}/`, {
+      headers
     });
     if (!res.ok) return null;
     return await res.json().catch(() => null);
