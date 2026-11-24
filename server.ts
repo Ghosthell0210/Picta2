@@ -466,6 +466,51 @@ function getScratchDiskStats(dirPath) {
     usedPercent: 20
   };
 }
+function detectContainerDiskEnvLimitBytes() {
+  try {
+    const gbEnv = Number(process.env.PICTA_MAX_DISK_GB || 0);
+    if (Number.isFinite(gbEnv) && gbEnv > 0) {
+      return { limitBytes: Math.round(gbEnv * 1024 * 1024 * 1024), sourceLabel: "PICTA_MAX_DISK_GB" };
+    }
+    const mbEnv = Number(process.env.DISK_LIMIT || process.env.P_SERVER_DISK || process.env.SERVER_DISK || process.env.PICTA_MAX_DISK_MB || 0);
+    if (Number.isFinite(mbEnv) && mbEnv > 0) {
+      return {
+        limitBytes: mbEnv > 1024 * 1024 * 100 ? Math.round(mbEnv) : Math.round(mbEnv * 1024 * 1024),
+        sourceLabel: process.env.DISK_LIMIT ? "DISK_LIMIT" : "ENV_CONTAINER"
+      };
+    }
+  } catch {
+  }
+  return null;
+}
+function measureDirectoryFiles(dirPath) {
+  let totalBytes = 0;
+  const files = [];
+  try {
+    if (!dirPath || !fs.existsSync(dirPath)) {
+      return { totalBytes: 0, files: [] };
+    }
+    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const fullPath = path.resolve(path.join(dirPath, entry.name));
+      try {
+        const st = fs.statSync(fullPath);
+        totalBytes += st.size;
+        files.push({
+          name: entry.name,
+          fullPath,
+          sizeBytes: st.size,
+          mtimeMs: st.mtimeMs
+        });
+      } catch {
+      }
+    }
+  } catch {
+  }
+  files.sort((a, b) => b.sizeBytes - a.sizeBytes);
+  return { totalBytes, files };
+}
 function ensureScratchSpaceForFile(dirPath, requiredBytes, protectedPaths = []) {
   const protectedSet = protectedPaths instanceof Set ? protectedPaths : new Set(protectedPaths.map((p) => path.resolve(p)));
   let freedBytes = 0;
@@ -489,21 +534,21 @@ function ensureScratchSpaceForFile(dirPath, requiredBytes, protectedPaths = []) 
   } catch {
   }
   const statsAfter = getScratchDiskStats(dirPath);
-  const requiredWithMargin = requiredBytes + 16 * 1024 * 1024;
-  const ok = statsAfter.freeBytes >= requiredBytes || statsAfter.freeBytes >= requiredWithMargin || statsAfter.freeBytes >= 512 * 1024 * 1024;
+  const ok = statsAfter.freeBytes >= requiredBytes;
   return {
-    ok: statsAfter.freeBytes >= requiredBytes,
+    ok,
     freedBytes,
     deletedFiles,
     freeBytesAfter: statsAfter.freeBytes
   };
 }
-function cleanupOrphanedScratchFiles(dirPath, protectedPaths = [], maxAgeMs = 30 * 60 * 1e3) {
+function cleanupOrphanedScratchFilesDetailed(dirPath, protectedPaths = [], maxAgeMs = 30 * 60 * 1e3) {
   const protectedSet = protectedPaths instanceof Set ? protectedPaths : new Set(protectedPaths.map((p) => path.resolve(p)));
   let removedCount = 0;
+  let freedBytes = 0;
   const now = Date.now();
   try {
-    if (!fs.existsSync(dirPath)) return 0;
+    if (!fs.existsSync(dirPath)) return { removedCount: 0, freedBytes: 0 };
     const entries = fs.readdirSync(dirPath, { withFileTypes: true });
     for (const entry of entries) {
       if (!entry.isFile()) continue;
@@ -511,16 +556,20 @@ function cleanupOrphanedScratchFiles(dirPath, protectedPaths = [], maxAgeMs = 30
       if (protectedSet.has(fullPath)) continue;
       try {
         const st = fs.statSync(fullPath);
-        if (now - st.mtimeMs >= maxAgeMs) {
+        if (maxAgeMs <= 0 || now - st.mtimeMs >= maxAgeMs) {
           fs.unlinkSync(fullPath);
           removedCount++;
+          freedBytes += st.size;
         }
       } catch {
       }
     }
   } catch {
   }
-  return removedCount;
+  return { removedCount, freedBytes };
+}
+function cleanupOrphanedScratchFiles(dirPath, protectedPaths = [], maxAgeMs = 30 * 60 * 1e3) {
+  return cleanupOrphanedScratchFilesDetailed(dirPath, protectedPaths, maxAgeMs).removedCount;
 }
 function getMemoryTelemetry() {
   const mem = process.memoryUsage();
@@ -3655,6 +3704,9 @@ function getTodayCubaDateStr() {
 }
 var QUEUE_TIMER_ALLOWED_MINUTES = [0, 5, 10, 15, 20, 30, 45, 60];
 var DEFAULT_QUEUE_SPACING_MINUTES = 20;
+var DEFAULT_SCRATCH_BUDGET_GB = 16;
+var ALLOWED_SCRATCH_BUDGET_GB = [5, 8.5, 16, 35, 0];
+var SCRATCH_SAFETY_RESERVE_BYTES = 512 * 1024 * 1024;
 var queueSpacingWakeupTimer = null;
 
 function loadQuotaSettingsFromDisk() {
@@ -3665,6 +3717,7 @@ function loadQuotaSettingsFromDisk() {
       if (parsed && typeof parsed === "object") {
         const lastDate = String(parsed.lastResetDate || parsed.currentDateCuba || today);
         const rawSpacing = typeof parsed.queueSpacingMinutes === "number" ? parsed.queueSpacingMinutes : DEFAULT_QUEUE_SPACING_MINUTES;
+        const rawBudgetGb = typeof parsed.maxScratchBudgetGb === "number" ? parsed.maxScratchBudgetGb : DEFAULT_SCRATCH_BUDGET_GB;
         return {
           maxSeriesPerDay: typeof parsed.maxSeriesPerDay === "number" ? parsed.maxSeriesPerDay : 7,
           seriesUploadedToday: Number(parsed.seriesUploadedToday || 0),
@@ -3675,7 +3728,10 @@ function loadQuotaSettingsFromDisk() {
           poolAccounts: Array.isArray(parsed.poolAccounts) ? parsed.poolAccounts : [],
           queueSpacingMinutes: Math.max(0, Math.min(180, Math.round(rawSpacing))),
           queueHumanJitterEnabled: typeof parsed.queueHumanJitterEnabled === "boolean" ? parsed.queueHumanJitterEnabled : true,
-          nextUploadAllowedAtMs: Number(parsed.nextUploadAllowedAtMs || 0)
+          nextUploadAllowedAtMs: Number(parsed.nextUploadAllowedAtMs || 0),
+          maxScratchBudgetGb: Number.isFinite(rawBudgetGb) && rawBudgetGb >= 0 && rawBudgetGb <= 500 ? Number(rawBudgetGb) : DEFAULT_SCRATCH_BUDGET_GB,
+          allowNextPrefetch: typeof parsed.allowNextPrefetch === "boolean" ? parsed.allowNextPrefetch : true,
+          lastEnospcAutoThrottleAt: parsed.lastEnospcAutoThrottleAt ? String(parsed.lastEnospcAutoThrottleAt) : void 0
         };
       }
     }
@@ -3691,7 +3747,9 @@ function loadQuotaSettingsFromDisk() {
     poolAccounts: [],
     queueSpacingMinutes: DEFAULT_QUEUE_SPACING_MINUTES,
     queueHumanJitterEnabled: true,
-    nextUploadAllowedAtMs: 0
+    nextUploadAllowedAtMs: 0,
+    maxScratchBudgetGb: DEFAULT_SCRATCH_BUDGET_GB,
+    allowNextPrefetch: true
   };
 }
 var quotaSettings = loadQuotaSettingsFromDisk();
@@ -9818,6 +9876,7 @@ ${formattedErr}`);
   }
 }
 var keepAliveActive = false;
+var prefetchPausedForDiskBudget = null;
 function getProtectedScratchPaths(excludeJobId) {
   const protectedSet = /* @__PURE__ */ new Set();
   const protectedIds = /* @__PURE__ */ new Set();
@@ -9827,16 +9886,238 @@ function getProtectedScratchPaths(excludeJobId) {
   for (const id of runningJobIds) {
     if (id !== excludeJobId) protectedIds.add(id);
   }
+  let stagedPrefetchKept = 0;
+  const nowMs = Date.now();
   for (const j of transferJobs) {
     if (!j || !j.tempFilePath || j.id === excludeJobId) continue;
-    const isStagedQueued = j.stage === "queued" && !j.minioKey && Boolean(j.integrityVerified) && (j.expectedBytes === 0 || j.diskVerifiedBytes === j.expectedBytes);
-    const hasResumablePart = (j.stage === "queued" || j.stage === "downloading_mtproto") && fs3.existsSync(`${j.tempFilePath}.part.json`);
-    if (protectedIds.has(j.id) || isStagedQueued || hasResumablePart) {
-      protectedSet.add(j.tempFilePath);
-      protectedSet.add(`${j.tempFilePath}.part.json`);
+    const isActivelyProtected = protectedIds.has(j.id);
+    const isStagedQueued = j.stage === "queued" && !j.minioKey && Boolean(j.integrityVerified) && (j.expectedBytes === 0 || j.diskVerifiedBytes === j.expectedBytes) && (!j.errorDetails || !j.errorDetails.includes("QUOTA_") && !isDailyLimitErrorText(j.errorDetails));
+    const isRecentQueuedPart = (j.stage === "queued" || j.stage === "downloading_mtproto") && fs3.existsSync(`${j.tempFilePath}.part.json`) && nowMs - new Date(j.updatedAt || j.createdAt || 0).getTime() < 2 * 60 * 60 * 1e3;
+    if (isActivelyProtected) {
+      protectedSet.add(path3.resolve(j.tempFilePath));
+      protectedSet.add(path3.resolve(`${j.tempFilePath}.part.json`));
+    } else if (isStagedQueued && stagedPrefetchKept < MAX_PREFETCH_LOOKAHEAD) {
+      stagedPrefetchKept++;
+      protectedSet.add(path3.resolve(j.tempFilePath));
+      protectedSet.add(path3.resolve(`${j.tempFilePath}.part.json`));
+    } else if (isRecentQueuedPart && stagedPrefetchKept < MAX_PREFETCH_LOOKAHEAD) {
+      protectedSet.add(path3.resolve(j.tempFilePath));
+      protectedSet.add(path3.resolve(`${j.tempFilePath}.part.json`));
     }
   }
   return protectedSet;
+}
+function getEffectiveDiskBudgetReport() {
+  const diskStats = getScratchDiskStats(TMP_UPLOAD_DIR);
+  const scratchMeasure = measureDirectoryFiles(TMP_UPLOAD_DIR);
+  const stateMeasure = measureDirectoryFiles(STATE_DIR);
+  const envLimit = detectContainerDiskEnvLimitBytes();
+  const configuredBudgetGb = typeof quotaSettings.maxScratchBudgetGb === "number" && quotaSettings.maxScratchBudgetGb >= 0
+    ? quotaSettings.maxScratchBudgetGb
+    : DEFAULT_SCRATCH_BUDGET_GB;
+  const usedScratchBytes = scratchMeasure.totalBytes;
+  const usedStateBytes = stateMeasure.totalBytes;
+  const usedTotalBotBytes = usedScratchBytes + usedStateBytes;
+  let budgetBytes = diskStats.totalBytes;
+  let budgetModeLabel = "Auto (Host)";
+  if (configuredBudgetGb > 0) {
+    budgetBytes = Math.round(configuredBudgetGb * 1024 * 1024 * 1024);
+    budgetModeLabel = configuredBudgetGb === 8.5 ? "8.5 GB (Seguro 10G)" : configuredBudgetGb === 16 ? "16 GB (Plan 20 GiB)" : configuredBudgetGb === 35 ? "35 GB (Plan 40G)" : `${configuredBudgetGb} GB`;
+  } else if (envLimit?.limitBytes) {
+    budgetBytes = Math.min(diskStats.totalBytes, envLimit.limitBytes);
+    budgetModeLabel = `Auto (${formatBytes(budgetBytes)} ${envLimit.sourceLabel})`;
+  }
+  if (envLimit?.limitBytes && envLimit.limitBytes < budgetBytes) {
+    budgetBytes = envLimit.limitBytes;
+  }
+  const safeAvailableInBudgetBytes = configuredBudgetGb > 0 || envLimit?.limitBytes
+    ? Math.max(0, Math.min(diskStats.freeBytes, budgetBytes - usedTotalBotBytes - SCRATCH_SAFETY_RESERVE_BYTES))
+    : Math.max(0, diskStats.freeBytes - SCRATCH_SAFETY_RESERVE_BYTES);
+  const budgetUsedPercent = budgetBytes > 0 ? Math.min(100, Math.max(0, Math.round(usedTotalBotBytes / budgetBytes * 100))) : diskStats.usedPercent;
+  return {
+    diskStats,
+    envLimit,
+    configuredBudgetGb,
+    budgetModeLabel,
+    budgetBytes,
+    usedScratchBytes,
+    usedStateBytes,
+    usedTotalBotBytes,
+    safeAvailableInBudgetBytes,
+    budgetUsedPercent,
+    scratchFiles: scratchMeasure.files
+  };
+}
+function runScratchCleanupNow(forcePruneFailed = false) {
+  const protectedPaths = getProtectedScratchPaths();
+  let removedCount = 0;
+  let freedBytes = 0;
+  for (const j of transferJobs) {
+    if (!j || !j.tempFilePath) continue;
+    const resolvedPath = path3.resolve(j.tempFilePath);
+    if (protectedPaths.has(resolvedPath)) continue;
+    const isFinished = j.stage === "completed" || j.stage === "cancelled";
+    const isOldFailed = j.stage === "failed" && (forcePruneFailed || Date.now() - new Date(j.updatedAt || j.createdAt || 0).getTime() >= 30 * 60 * 1e3);
+    if (isFinished || isOldFailed) {
+      for (const p of [j.tempFilePath, `${j.tempFilePath}.part.json`]) {
+        try {
+          if (fs3.existsSync(p)) {
+            const st = fs3.statSync(p);
+            fs3.unlinkSync(p);
+            removedCount++;
+            freedBytes += st.size;
+          }
+        } catch {
+        }
+      }
+    }
+  }
+  const orphanRes = cleanupOrphanedScratchFilesDetailed(
+    TMP_UPLOAD_DIR,
+    protectedPaths,
+    forcePruneFailed ? 0 : 30 * 60 * 1e3
+  );
+  removedCount += orphanRes.removedCount;
+  freedBytes += orphanRes.freedBytes;
+  return { removedCount, freedBytes };
+}
+function canFitInScratchBudget(requiredBytes, existingTempFilePath) {
+  if (existingTempFilePath && fs3.existsSync(existingTempFilePath)) {
+    try {
+      const sz = fs3.statSync(existingTempFilePath).size;
+      if (requiredBytes <= 0 || sz >= requiredBytes) {
+        return { ok: true, report: getEffectiveDiskBudgetReport() };
+      }
+    } catch {
+    }
+  }
+  const need = Math.max(0, Number(requiredBytes || 0));
+  const report = getEffectiveDiskBudgetReport();
+  if (report.configuredBudgetGb > 0 || report.envLimit?.limitBytes) {
+    const projectedBytes = report.usedTotalBotBytes + need + SCRATCH_SAFETY_RESERVE_BYTES;
+    return {
+      ok: projectedBytes <= report.budgetBytes && report.diskStats.freeBytes >= need + 256 * 1024 * 1024,
+      report
+    };
+  }
+  return {
+    ok: report.diskStats.freeBytes >= need + SCRATCH_SAFETY_RESERVE_BYTES,
+    report
+  };
+}
+function isEnospcError(err) {
+  const code = String(err?.code || "").toUpperCase();
+  const msg = String(err?.message || err || "");
+  return code === "ENOSPC" || /ENOSPC|no space left on device|espacio insuficiente/i.test(msg);
+}
+function handleEnospcAutoProtect(err, failedJobId) {
+  if (!isEnospcError(err)) return false;
+  const cleaned = runScratchCleanupNow(true);
+  const reportAfter = getEffectiveDiskBudgetReport();
+  const usedGbNow = reportAfter.usedTotalBotBytes / (1024 * 1024 * 1024);
+  const safeCapGb = Math.max(3, Math.floor((usedGbNow + 1.5) * 2) / 2);
+  if (quotaSettings.maxScratchBudgetGb === 0 || safeCapGb < quotaSettings.maxScratchBudgetGb) {
+    quotaSettings.maxScratchBudgetGb = safeCapGb;
+  }
+  quotaSettings.allowNextPrefetch = false;
+  quotaSettings.lastEnospcAutoThrottleAt = (/* @__PURE__ */ new Date()).toISOString();
+  saveQuotaSettingsToDisk();
+  addLiveLog(
+    "system",
+    "warn",
+    `Escudo anti-ENOSPC activado${failedJobId ? ` (${failedJobId})` : ""}: liberados ${formatBytes(cleaned.freedBytes)} (${cleaned.removedCount} archivo(s)), techo ajustado a ${quotaSettings.maxScratchBudgetGb} GB y pre-descarga secuencial activada.`
+  );
+  return true;
+}
+async function sendOrEditDiskManagerInTelegram(chatId, messageId, replyToMessageId, notice) {
+  const isMaster = isMasterAdminChat(chatId);
+  if (!isMaster) {
+    const txt = `\u2139\uFE0F El disco temporal de transferencias se gestiona autom\xE1ticamente para tus videos.`;
+    if (messageId) {
+      await editTelegramStatusMessage(chatId, messageId, txt, [[{ text: "\u25C8 Men\xFA Principal", callback_data: "cmd_start" }]], true);
+    } else {
+      await sendTelegramStatusMessage(chatId, txt, replyToMessageId);
+    }
+    return;
+  }
+  const rep = getEffectiveDiskBudgetReport();
+  const memStats = getMemoryTelemetry();
+  const curBudgetGb = rep.configuredBudgetGb;
+  const prefetchOn = quotaSettings.allowNextPrefetch !== false;
+  const budgetPctStr = `${rep.budgetUsedPercent}%`;
+  const activeJobsSet = /* @__PURE__ */ new Map();
+  for (const j of transferJobs) {
+    if (j?.tempFilePath) {
+      activeJobsSet.set(path3.resolve(j.tempFilePath), j);
+    }
+  }
+  const fileLines = rep.scratchFiles.slice(0, 5).map((f) => {
+    const ownerJob = activeJobsSet.get(f.fullPath) || activeJobsSet.get(f.fullPath.replace(/\.part\.json$/i, ""));
+    let badge = "\u{1F5D1}\uFE0F Residual";
+    if (ownerJob) {
+      if (ownerJob.id === activeUploadJobId) badge = "\u{1F4E4} Subiendo";
+      else if (ownerJob.id === activeDownloadJobId) badge = "\u2B07\uFE0F Descargando";
+      else if (ownerJob.stage === "queued" && ownerJob.integrityVerified) badge = "\u2705 Pre-descargado";
+      else if (ownerJob.stage === "failed") badge = "\u26A0\uFE0F Fallido";
+      else if (ownerJob.stage === "completed" || ownerJob.stage === "cancelled") badge = "\u{1F9F9} Limpiable";
+    }
+    const label = ownerJob?.title ? ownerJob.title.slice(0, 26) : f.name.slice(0, 26);
+    return `\u2022 ${badge} <b>${escapeHtml(label)}</b> \xB7 <code>${formatBytes(f.sizeBytes)}</code>`;
+  });
+  const textOut = (notice ? `${notice}
+
+` : "") + `${hudHeader("GESTI\xD3N DE DISCO Y PLAN · PLUGGED HOST")}
+` + hudBox([
+    `\u{1F4C1} <b>Carpeta scratch:</b> <code>${escapeHtml(rep.diskStats.path)}</code>`,
+    `\u{1F4E6} <b>Uso real del bot:</b> <code>${formatBytes(rep.usedTotalBotBytes)}</code> (Videos: ${formatBytes(rep.usedScratchBytes)} \xB7 Estado: ${formatBytes(rep.usedStateBytes)})`,
+    `\u{1F6E1}\uFE0F <b>Techo seguro activo:</b> <b>${escapeHtml(rep.budgetModeLabel)}</b>`,
+    `\u{1F4CA} <b>Ocupaci\xF3n del techo:</b> <code>${renderVisualBar(rep.budgetUsedPercent)}</code> (${budgetPctStr})`,
+    `\u2705 <b>Margen seguro libre:</b> <code>${formatBytes(rep.safeAvailableInBudgetBytes)}</code>`,
+    `\u26A1 <b>Pre-descarga:</b> ${prefetchOn ? "1 video siguiente a la vez" : "Desactivada (0 pre-descarga · secuencial)"}`,
+    prefetchPausedForDiskBudget ? `\u23F8\uFE0F <b>Pre-descarga pausada:</b> "${escapeHtml(prefetchPausedForDiskBudget.jobTitle.slice(0, 24))}" espera fin de subida actual para no exceder ${prefetchPausedForDiskBudget.budgetGb} GB` : null
+  ]) + `
+
+${hudSection("Referencia del Contenedor / Nodo")}
+` + hudBox([
+    `\u{1F5A5}\uFE0F <b>Reportado por Host (statfs):</b> ${formatBytes(rep.diskStats.freeBytes)} libres / ${formatBytes(rep.diskStats.totalBytes)}`,
+    rep.envLimit ? `\u{1F4CF} <b>Variable entorno (${escapeHtml(rep.envLimit.sourceLabel)}):</b> ${formatBytes(rep.envLimit.limitBytes)}` : `\u2139\uFE0F <i>El nodo compartido puede reportar espacio mayor al de tu plan real (ej. 20 GiB); el bot respeta el techo seguro de arriba.</i>`,
+    `\u{1F9E0} <b>RAM proceso:</b> ${formatBytes(memStats.rssBytes)} (Heap ${formatBytes(memStats.heapUsedBytes)})`
+  ]) + (fileLines.length > 0 ? `
+
+${hudSection(`Archivos en Scratch (${rep.scratchFiles.length})`)}
+${fileLines.join("\n")}` : `
+
+\u{1F9F9} <i>Carpeta de videos temporales completamente vac\xEDa (0 B ocupados).</i>`);
+  const budgetRow = ALLOWED_SCRATCH_BUDGET_GB.map((gb) => {
+    const active = curBudgetGb === gb;
+    const label = gb === 0 ? "Auto" : gb === 8.5 ? "8.5G" : `${gb}G`;
+    return {
+      text: active ? `\u2705 ${label}` : label,
+      callback_data: `disk_budget:${gb}`
+    };
+  });
+  const keyboard = [
+    [
+      { text: "\u{1F9F9} Limpiar Residuos Ahora", callback_data: "disk_clean:now" },
+      { text: "\u{1F504} Actualizar", callback_data: "disk_refresh" }
+    ],
+    budgetRow,
+    [
+      {
+        text: prefetchOn ? "\u26A1 Pre-descarga: 1 video \u2705" : "\u{1F512} Pre-descarga: 0 (Secuencial)",
+        callback_data: "disk_prefetch:toggle"
+      }
+    ],
+    [
+      { text: "\u{1F4CB} Ver Cola (/cola)", callback_data: "queue_view" },
+      { text: "\u25C8 Men\xFA Principal", callback_data: "cmd_start" }
+    ]
+  ];
+  if (messageId) {
+    await editTelegramStatusMessage(chatId, messageId, textOut, keyboard, true);
+  } else {
+    await sendTelegramStatusMessage(chatId, textOut, replyToMessageId, keyboard);
+  }
 }
 function buildPipelineJobsMap() {
   const map = /* @__PURE__ */ new Map();
@@ -9985,6 +10266,9 @@ async function prepareJobMetadataBeforeTransfer(job, customTitle) {
 }
 async function handleJobPipelineFailure(job, statusMsgId, err) {
   const errMsg = err instanceof Error ? err.message : String(err);
+  if (isEnospcError(err)) {
+    handleEnospcAutoProtect(err, job.id);
+  }
   if (errMsg.includes("SUBIDA_CANCELADA_POR_USUARIO") || cancelledJobIds.has(job.id)) {
     removeJobFromUploadQueue(job.id);
     job.stage = "cancelled";
@@ -10582,17 +10866,42 @@ async function scheduleTransferPipeline() {
     }
     if (!activeDownloadJobId) {
       const freshMap = buildPipelineJobsMap();
-      const nextDownload = selectNextDownloadJob(
-        uploadQueue,
-        freshMap,
-        activeDownloadJobId,
-        activeUploadJobId,
-        MAX_PREFETCH_LOOKAHEAD
-      );
-      if (nextDownload) {
-        const jobObj = transferJobs.find((j) => j.id === nextDownload.id);
-        if (jobObj && !runningJobIds.has(jobObj.id)) {
-          void runDownloadStage(jobObj);
+      const allowPrefetch = quotaSettings.allowNextPrefetch !== false;
+      if (!allowPrefetch && activeUploadJobId) {
+        prefetchPausedForDiskBudget = null;
+      } else {
+        const nextDownload = selectNextDownloadJob(
+          uploadQueue,
+          freshMap,
+          activeDownloadJobId,
+          activeUploadJobId,
+          MAX_PREFETCH_LOOKAHEAD
+        );
+        if (nextDownload) {
+          const jobObj = transferJobs.find((j) => j.id === nextDownload.id);
+          if (jobObj && !runningJobIds.has(jobObj.id)) {
+            let budgetCheck = canFitInScratchBudget(jobObj.expectedBytes, jobObj.tempFilePath);
+            if (!budgetCheck.ok) {
+              const cleaned = runScratchCleanupNow(false);
+              if (cleaned.freedBytes > 0) {
+                budgetCheck = canFitInScratchBudget(jobObj.expectedBytes, jobObj.tempFilePath);
+              }
+            }
+            const hasBlockingDiskJob = Boolean(activeUploadJobId || budgetCheck.report.usedScratchBytes > 50 * 1024 * 1024);
+            if (!budgetCheck.ok && hasBlockingDiskJob) {
+              prefetchPausedForDiskBudget = {
+                jobTitle: jobObj.title || jobObj.fileName,
+                neededBytes: jobObj.expectedBytes,
+                budgetGb: budgetCheck.report.configuredBudgetGb,
+                usedBytes: budgetCheck.report.usedTotalBotBytes
+              };
+            } else {
+              prefetchPausedForDiskBudget = null;
+              void runDownloadStage(jobObj);
+            }
+          }
+        } else {
+          prefetchPausedForDiskBudget = null;
         }
       }
     }
@@ -10751,11 +11060,20 @@ async function sendOrEditQueueManagerInTelegram(chatId, messageId, replyToMessag
     ]) + `
 `;
   }
+  const diskInfoNote = isMaster ? (() => {
+    const dRep = getEffectiveDiskBudgetReport();
+    const budgetStr = dRep.configuredBudgetGb > 0 ? `${dRep.configuredBudgetGb} GB` : "Auto";
+    const pauseNote = prefetchPausedForDiskBudget
+      ? ` \xB7 \u23F8\uFE0F <i>Pre-descarga espera fin de subida (techo ${budgetStr})</i>`
+      : "";
+    return `\u{1F4BE} <b>Disco Bot:</b> <code>${formatBytes(dRep.usedTotalBotBytes)}</code> / <code>${budgetStr}</code> \xB7 Pre-descarga: ${quotaSettings.allowNextPrefetch !== false ? "1 video" : "0 (secuencial)"}${pauseNote}\n\n`;
+  })() : "";
   if (!activeBlock) {
     activeBlock = `\u{1F7E2} <b>Estado del motor:</b> <i>En reposo (listo para recibir videos).</i>
 \u23F1\uFE0F <b>Temporizador entre subidas en cola:</b> ${curTimerMins > 0 ? `<b>${curTimerMins} min</b>${quotaSettings.queueHumanJitterEnabled !== false ? " (\xB12m humano)" : ""}` : "<i>Desactivado (0 min)</i>"}
-
-`;
+${diskInfoNote}`;
+  } else if (diskInfoNote) {
+    activeBlock += diskInfoNote;
   }
   const encoderBlock = encoderWaitingJobs.length > 0 ? `${hudSection(`Esperando codificador (${encoderWaitingJobs.length})`)}
 ` + encoderWaitingJobs.slice(0, 6).map((j, idx) => {
@@ -10862,6 +11180,7 @@ ${activeBlock}${encoderBlock}${queueBlock}${pinnedBlock}`;
   ]);
   keyboard.push([
     { text: "\u{1F504} Actualizar Cola", callback_data: "queue_view" },
+    ...(isMaster ? [{ text: "\u{1F4BE} Disco (/disco)", callback_data: "disk_view" }] : []),
     { text: "\u{1F4CA} Videos (/stats)", callback_data: "dash_refresh:views:0" }
   ]);
   keyboard.push([{ text: "\u25C8 Men\xFA Principal", callback_data: "cmd_start" }]);
@@ -19977,6 +20296,77 @@ Esta acci\xF3n eliminar\xE1 o retirar\xE1 el cap\xEDtulo/video de tu canal en Pi
       );
       return;
     }
+    if (data === "disk_view" || data === "disk_refresh") {
+      await callTelegramBotApi("answerCallbackQuery", {
+        callback_query_id: cq.id,
+        text: "Analizando espacio real en disco..."
+      }).catch(() => {
+      });
+      await sendOrEditDiskManagerInTelegram(chatId2, messageId);
+      return;
+    }
+    if (data === "disk_clean:now") {
+      if (!isMasterAdminChat(chatId2)) return;
+      const resClean = runScratchCleanupNow(true);
+      await callTelegramBotApi("answerCallbackQuery", {
+        callback_query_id: cq.id,
+        text: resClean.removedCount > 0 ? `\u{1F9F9} Liberados ${formatBytes(resClean.freedBytes)}` : "\u2705 Sin archivos residuales que borrar"
+      }).catch(() => {
+      });
+      void scheduleTransferPipeline();
+      await sendOrEditDiskManagerInTelegram(
+        chatId2,
+        messageId,
+        void 0,
+        resClean.removedCount > 0
+          ? `\u{1F9F9} <b>Limpieza completada:</b> se eliminaron <code>${resClean.removedCount}</code> archivo(s) residuales y se liberaron <b>${formatBytes(resClean.freedBytes)}</b>.`
+          : `\u2705 <b>El disco ya estaba limpio:</b> solo se conservan los archivos activos protegidos.`
+      );
+      return;
+    }
+    if (data === "disk_prefetch:toggle") {
+      if (!isMasterAdminChat(chatId2)) return;
+      quotaSettings.allowNextPrefetch = quotaSettings.allowNextPrefetch === false;
+      saveQuotaSettingsToDisk();
+      await callTelegramBotApi("answerCallbackQuery", {
+        callback_query_id: cq.id,
+        text: quotaSettings.allowNextPrefetch ? "\u26A1 Pre-descarga: 1 video a la vez" : "\u{1F512} Modo secuencial (0 pre-descarga)"
+      }).catch(() => {
+      });
+      void scheduleTransferPipeline();
+      await sendOrEditDiskManagerInTelegram(
+        chatId2,
+        messageId,
+        void 0,
+        quotaSettings.allowNextPrefetch
+          ? `\u26A1 <b>Pre-descarga unitaria activada:</b> el bot pre-descargar\xE1 solo <b>1 video siguiente</b> si cabe dentro del techo seguro.`
+          : `\u{1F512} <b>Modo secuencial estricto activado:</b> el bot descargar\xE1 cada video \xFAnicamente cuando le toque subir (m\xEDnimo consumo de disco).`
+      );
+      return;
+    }
+    if (data.startsWith("disk_budget:")) {
+      if (!isMasterAdminChat(chatId2)) return;
+      const gbVal = Number(data.slice("disk_budget:".length));
+      if (Number.isFinite(gbVal) && gbVal >= 0 && gbVal <= 500) {
+        quotaSettings.maxScratchBudgetGb = gbVal;
+        saveQuotaSettingsToDisk();
+        void scheduleTransferPipeline();
+      }
+      await callTelegramBotApi("answerCallbackQuery", {
+        callback_query_id: cq.id,
+        text: gbVal === 0 ? "\u267E\uFE0F Techo de disco: Autom\xE1tico (Host)" : `\u{1F6E1}\uFE0F Techo seguro fijado en ${gbVal} GB`
+      }).catch(() => {
+      });
+      await sendOrEditDiskManagerInTelegram(
+        chatId2,
+        messageId,
+        void 0,
+        gbVal === 0
+          ? `\u267E\uFE0F <b>Techo fijado en Autom\xE1tico:</b> usar\xE1 el l\xEDmite detectado por el host.`
+          : `\u{1F6E1}\uFE0F <b>Techo seguro actualizado a ${gbVal} GB:</b> el bot limitar\xE1 su cach\xE9 temporal por debajo de esa cifra.`
+      );
+      return;
+    }
     if (data === "quota_menu") {
       pendingPoolAccountByChat.delete(chatId2);
       await callTelegramBotApi("answerCallbackQuery", {
@@ -22695,28 +23085,7 @@ Escribe ahora el t\xEDtulo que pidi\xF3 el suscriptor (o usa <code>/pedir Nombre
     return;
   }
   if (text.startsWith("/disco")) {
-    if (!isMasterAdminChat(chatId)) {
-      await sendTelegramStatusMessage(
-        chatId,
-        `\u2139\uFE0F El disco temporal de transferencias se gestiona autom\xE1ticamente para tus videos.`,
-        msg.message_id
-      );
-      return;
-    }
-    const diskStats = getScratchDiskStats(TMP_UPLOAD_DIR);
-    const memStats = getMemoryTelemetry();
-    const storageLabel = diskStats.storageType === "ephemeral_disk" ? "Disco ef\xEDmero real (sin consumir RAM)" : diskStats.storageType === "tmpfs_ram" ? "Memoria temporal (tmpfs)" : "Almacenamiento autom\xE1tico";
-    await sendTelegramStatusMessage(
-      chatId,
-      `\u{1F4BE} <b>Estado de Disco Ef\xEDmero y RAM (Autom\xE1tico)</b>
-
-<blockquote>\u{1F4C1} <b>Ruta activa:</b> <code>${escapeHtml(diskStats.path)}</code>
-\u2699\uFE0F <b>Tipo:</b> ${storageLabel}
-\u{1F4BD} <b>Espacio libre:</b> ${formatBytes(diskStats.freeBytes)} / ${formatBytes(diskStats.totalBytes)} (${diskStats.usedPercent}% usado)
-\u{1F9E0} <b>RAM proceso:</b> ${formatBytes(memStats.rssBytes)} (Heap ${formatBytes(memStats.heapUsedBytes)})
-\u{1F504} <b>Pipeline:</b> 1 descarga + 1 subida simult\xE1nea</blockquote>`,
-      msg.message_id
-    );
+    await sendOrEditDiskManagerInTelegram(chatId, void 0, msg.message_id);
     return;
   }
   if (text.startsWith("/reintentar") || text.startsWith("/retry")) {
@@ -24462,21 +24831,17 @@ async function startServer() {
     }
     const scratchCleanupInterval = setInterval(() => {
       try {
-        const cleaned = cleanupOrphanedScratchFiles(
-          TMP_UPLOAD_DIR,
-          getProtectedScratchPaths(),
-          2 * 60 * 60 * 1e3
-        );
-        if (cleaned > 0) {
+        const resClean = runScratchCleanupNow(false);
+        if (resClean.removedCount > 0) {
           addLiveLog(
             "system",
             "info",
-            `Limpieza peri\xF3dica scratch: ${cleaned} archivo(s) antiguo(s) eliminado(s).`
+            `Guardi\xE1n peri\xF3dico scratch (15 min): ${resClean.removedCount} archivo(s) residuales eliminados (${formatBytes(resClean.freedBytes)} liberados).`
           );
         }
       } catch {
       }
-    }, 30 * 60 * 1e3);
+    }, 15 * 60 * 1e3);
     if (typeof scratchCleanupInterval.unref === "function") {
       scratchCleanupInterval.unref();
     }
