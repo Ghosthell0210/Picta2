@@ -8797,6 +8797,17 @@ async function uploadSubtitleBufferToMinioS3(token, subBuf, fileName) {
     return null;
   }
 }
+function clearUnconfirmedGhostMinioKey(job) {
+  if (!job || !job.minioKey || job.s3UploadConfirmed === true) return false;
+  const errText = String(job.errorDetails || "");
+  if (/Error de red en S3 Picta|Error S3 MinIO|Timeout de red|videos\.picta\.cu|Conexi\xF3n S3 estancada/i.test(errText)) {
+    job.minioKey = void 0;
+    job.pendingMinioKey = void 0;
+    job.s3UploadConfirmed = false;
+    return true;
+  }
+  return false;
+}
 async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
   const isMaster = isMasterAdminChat(job.telegramChatId);
   const userContext = getEffectivePictaContext(job.telegramChatId);
@@ -8819,9 +8830,16 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
   );
   let accessToken = activeAuth.token;
   job.preferredUploadAccountLabel = activeAuth.accountLabel;
+  if (clearUnconfirmedGhostMinioKey(job)) {
+    addLiveLog(
+      "picta",
+      "warn",
+      `Llave S3 previa sin confirmar descartada para "${job.fileName}" tras fallo anterior de red en S3.`
+    );
+  }
   saveJobsToDisk();
   const fileSize = filePath && fs3.existsSync(filePath) ? fs3.statSync(filePath).size : job.diskVerifiedBytes || job.expectedBytes;
-  const maxS3Attempts = 8;
+  const maxS3Attempts = 5;
   let finalMinioKey = job.minioKey || "";
   if (finalMinioKey) {
     addLiveLog(
@@ -8830,6 +8848,9 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
       `El video "${job.fileName}" ya se encuentra 100% alojado en S3 MinIO (key=${finalMinioKey}). Reutilizando archivo y pasando directo a creaci\xF3n de publicaci\xF3n.`
     );
   } else {
+    if (!filePath || !fs3.existsSync(filePath)) {
+      throw new Error("Archivo local no encontrado en disco scratch para subir a S3 Picta.");
+    }
     for (let attempt = 1; attempt <= maxS3Attempts; attempt++) {
       try {
         const minioCredRes = await fetchPictaWithRetry(
@@ -8882,8 +8903,10 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
         if (!s3Endpoint || !s3Fields || !s3Fields.key) {
           throw new Error("Respuesta inv\xE1lida de devolver_url_minio.");
         }
-        finalMinioKey = s3Fields.key;
-        job.minioKey = s3Fields.key;
+        const candidateMinioKey = String(s3Fields.key);
+        job.pendingMinioKey = candidateMinioKey;
+        job.minioKey = void 0;
+        job.s3UploadConfirmed = false;
         job.stage = "uploading_full_file_to_picta";
         job.uploadedBytes = 0;
         job.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
@@ -8894,8 +8917,9 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
           `${hudHeader("FASE 3/4 \xB7 CONECTANDO CON S3 PICTA")}
 ` + hudBox([
             `\u{1F3AC} <b>T\xEDtulo:</b> ${escapeHtml(job.title)}`,
-            `\u{1F511} <b>Manifiesto MinIO:</b> <code>${finalMinioKey}</code>`,
-            `\u{1F4E4} <b>Tama\xF1o a enviar:</b> ${formatBytes(fileSize)}`
+            `\u{1F511} <b>Manifiesto MinIO:</b> <code>${candidateMinioKey}</code> (en tr\xE1nsito)`,
+            `\u{1F4E4} <b>Tama\xF1o a enviar:</b> ${formatBytes(fileSize)}`,
+            attempt > 1 ? `\u{1F504} <b>Intento S3:</b> ${attempt}/${maxS3Attempts}` : null
           ]) + `
 \u23F3 <i>Iniciando transmisi\xF3n directa hacia videos.picta.cu...</i>`,
           void 0,
@@ -8904,7 +8928,7 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
         addLiveLog(
           "picta",
           "info",
-          `Subiendo archivo 100% entero (${formatBytes(fileSize)}) a S3 MinIO (${s3Endpoint}, key: ${s3Fields.key}, intento ${attempt}/${maxS3Attempts})...`
+          `Subiendo archivo 100% entero (${formatBytes(fileSize)}) a S3 MinIO (${s3Endpoint}, key: ${candidateMinioKey}, intento ${attempt}/${maxS3Attempts})...`
         );
         const boundary = `----PictaMinioS3Boundary${Date.now().toString(16)}`;
         const crlf = "\r\n";
@@ -8941,10 +8965,26 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
         let lastTelegramEdit = 0;
         await new Promise((resolve, reject) => {
           let settled = false;
+          let lastWriteProgressAt = Date.now();
+          let allBytesSentToSocket = false;
+          let stallTimer = null;
+          const cleanupWatchdog = () => {
+            if (stallTimer) {
+              clearInterval(stallTimer);
+              stallTimer = null;
+            }
+          };
           const failOnce = (err) => {
             if (settled) return;
             settled = true;
+            cleanupWatchdog();
             reject(err);
+          };
+          const succeedOnce = () => {
+            if (settled) return;
+            settled = true;
+            cleanupWatchdog();
+            resolve();
           };
           const req = transport.request(
             {
@@ -8953,9 +8993,12 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
               port: parsedS3Url.port || (isHttps ? 443 : 80),
               path: parsedS3Url.pathname + parsedS3Url.search,
               method: "POST",
+              agent: false,
+              family: 4,
               headers: {
                 "Content-Type": `multipart/form-data; boundary=${boundary}`,
                 "Content-Length": totalContentLength,
+                Connection: "close",
                 Origin: "https://admin.picta.cu",
                 Referer: "https://admin.picta.cu/"
               }
@@ -8964,15 +9007,18 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
               const chunks = [];
               res.on("data", (d) => chunks.push(Buffer.from(d)));
               res.on("end", () => {
-                if (settled) return;
-                settled = true;
                 const bodyText = Buffer.concat(chunks).toString("utf-8");
                 job.pictaResponseCode = res.statusCode || 0;
                 if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
                   job.uploadedBytes = fileSize;
-                  resolve();
+                  finalMinioKey = candidateMinioKey;
+                  job.minioKey = candidateMinioKey;
+                  job.pendingMinioKey = void 0;
+                  job.s3UploadConfirmed = true;
+                  saveJobsToDisk();
+                  succeedOnce();
                 } else {
-                  reject(
+                  failOnce(
                     new Error(
                       `Error S3 MinIO HTTP ${res.statusCode}: ${bodyText.slice(0, 220) || res.statusMessage}`
                     )
@@ -8985,13 +9031,64 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
             sock.setNoDelay?.(true);
             sock.setKeepAlive?.(true, 1e4);
           });
-          req.setTimeout(6e5, () => {
-            req.destroy(new Error("Timeout de red (10 minutos sin respuesta de videos.picta.cu)"));
+          req.setTimeout(3e5, () => {
+            const pctNow = fileSize > 0 ? Math.min(100, Math.round(job.uploadedBytes / fileSize * 100)) : 0;
+            req.destroy(
+              new Error(
+                allBytesSentToSocket
+                  ? `Timeout esperando respuesta final de videos.picta.cu tras enviar 100% (${formatBytes(fileSize)})`
+                  : `Timeout de socket en videos.picta.cu en ${pctNow}% (${formatBytes(job.uploadedBytes)} / ${formatBytes(fileSize)})`
+              )
+            );
           });
           const readStream = fs3.createReadStream(filePath, {
             highWaterMark: S3_UPLOAD_HIGH_WATER_MARK_BYTES
             // 256 KB strict lean RAM profile on Ephemeral Disk
           });
+          stallTimer = setInterval(() => {
+            if (settled) {
+              cleanupWatchdog();
+              return;
+            }
+            const idleMs = Date.now() - lastWriteProgressAt;
+            const pctNow = fileSize > 0 ? Math.min(100, Math.round(job.uploadedBytes / fileSize * 100)) : 0;
+            if (!allBytesSentToSocket && idleMs > 9e4) {
+              const stallErr = new Error(
+                `Conexi\xF3n S3 estancada 90s sin respuesta de videos.picta.cu en ${pctNow}% (${formatBytes(job.uploadedBytes)} / ${formatBytes(fileSize)})`
+              );
+              readStream.destroy();
+              req.destroy(stallErr);
+              failOnce(stallErr);
+            } else if (allBytesSentToSocket && idleMs > 3e5) {
+              const ackErr = new Error(
+                `Timeout esperando confirmaci\xF3n HTTP de videos.picta.cu tras enviar 100% (${formatBytes(fileSize)})`
+              );
+              req.destroy(ackErr);
+              failOnce(ackErr);
+            }
+          }, 5e3);
+          const waitForDrainOrSettled = () =>
+            new Promise((resDrain) => {
+              if (settled || req.destroyed) {
+                resDrain();
+                return;
+              }
+              const done = () => {
+                req.off("drain", onDrain);
+                req.off("close", done);
+                req.off("error", done);
+                req.off("finish", done);
+                resDrain();
+              };
+              const onDrain = () => {
+                lastWriteProgressAt = Date.now();
+                done();
+              };
+              req.once("drain", onDrain);
+              req.once("close", done);
+              req.once("error", done);
+              req.once("finish", done);
+            });
           req.on("error", (err) => {
             readStream.destroy();
             const detail = err?.message || err?.code || (Array.isArray(err?.errors) ? err.errors.map((e) => e?.message || e?.code).join(", ") : "Conexi\xF3n reiniciada por videos.picta.cu");
@@ -9004,8 +9101,9 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
           void (async () => {
             try {
               if (!req.write(prologueBuf)) {
-                await new Promise((r) => req.once("drain", r));
+                await waitForDrainOrSettled();
               }
+              lastWriteProgressAt = Date.now();
               for await (const chunk of readStream) {
                 if (settled) break;
                 if (cancelledJobIds.has(job.id)) {
@@ -9015,15 +9113,17 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
                 }
                 const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
                 if (!req.write(buf)) {
-                  await new Promise((r) => req.once("drain", r));
+                  await waitForDrainOrSettled();
                 }
+                if (settled) break;
+                lastWriteProgressAt = Date.now();
                 job.uploadedBytes += buf.byteLength;
                 const elapsedSec = Math.max(0.5, (Date.now() - startTime) / 1e3);
                 job.speedMBps = Number(
                   (job.uploadedBytes / (1024 * 1024) / elapsedSec).toFixed(2)
                 );
                 const pct = Math.min(100, Math.round(job.uploadedBytes / fileSize * 100));
-                currentActivity = `Subiendo archivo entero a S3 Picta (${s3Fields.key}): ${formatBytes(job.uploadedBytes)} / ${formatBytes(fileSize)} (${pct}%) a ${job.speedMBps} MB/s`;
+                currentActivity = `Subiendo archivo entero a S3 Picta (${candidateMinioKey}): ${formatBytes(job.uploadedBytes)} / ${formatBytes(fileSize)} (${pct}%) a ${job.speedMBps} MB/s`;
                 const now = Date.now();
                 if (now - lastTelegramEdit > 4e3) {
                   lastTelegramEdit = now;
@@ -9034,7 +9134,7 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
                     `${hudHeader("FASE 3/4 \xB7 TRANSMITIENDO A S3 PICTA")}
 ` + hudBox([
                       `\u{1F3AC} <b>T\xEDtulo:</b> ${escapeHtml(job.title)}`,
-                      `\u{1F511} <b>Manifiesto:</b> <code>${s3Fields.key}</code>`,
+                      `\u{1F511} <b>Manifiesto:</b> <code>${candidateMinioKey}</code>`,
                       `\u{1F4CA} <b>Progreso:</b> <code>${renderVisualBar(pct)}</code>`,
                       `\u{1F4E4} <b>Enviado:</b> ${formatBytes(job.uploadedBytes)} / ${formatBytes(fileSize)}`,
                       `\u26A1 <b>Velocidad:</b> ${job.speedMBps} MB/s`,
@@ -9046,7 +9146,22 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
                 }
               }
               if (!settled) {
+                allBytesSentToSocket = true;
+                lastWriteProgressAt = Date.now();
                 req.end(epilogueBuf);
+                void editTelegramStatusMessage(
+                  job.telegramChatId,
+                  statusMsgId,
+                  `${hudHeader("FASE 3/4 \xB7 CONFIRMANDO EN S3 PICTA")}
+` + hudBox([
+                    `\u{1F3AC} <b>T\xEDtulo:</b> ${escapeHtml(job.title)}`,
+                    `\u{1F511} <b>Manifiesto:</b> <code>${candidateMinioKey}</code>`,
+                    `\u{1F4CA} <b>Progreso:</b> <code>${renderVisualBar(100)}</code>`,
+                    `\u{1F4E4} <b>Enviado:</b> ${formatBytes(fileSize)} / ${formatBytes(fileSize)}`
+                  ]) + `
+\u23F3 <i>100% transmitido — esperando confirmaci\xF3n final de videos.picta.cu...</i>`,
+                  [[{ text: "\u{1F6D1} Cancelar subida", callback_data: `cancel_job:${job.id}` }]]
+                );
               }
             } catch (streamErr) {
               if (!settled) {
@@ -9059,17 +9174,36 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
         });
         break;
       } catch (s3Err) {
+        job.pendingMinioKey = void 0;
+        if (!job.s3UploadConfirmed) {
+          job.minioKey = void 0;
+        }
+        saveJobsToDisk();
         const errMsg = s3Err instanceof Error ? s3Err.message : String(s3Err);
         if (errMsg.includes("SUBIDA_CANCELADA_POR_USUARIO") || errMsg.includes("QUOTA_") || cancelledJobIds.has(job.id)) {
           throw s3Err instanceof Error ? s3Err : new Error(errMsg);
         }
         if (attempt < maxS3Attempts) {
-          const backoffSec = Math.min(20, attempt * 4);
+          const backoffSec = Math.min(20, attempt * 5);
           addLiveLog(
             "picta",
             "warn",
-            `Reintentando subida S3 MinIO (${attempt}/${maxS3Attempts}) en ${backoffSec}s tras: ${errMsg.slice(0, 110)}`
+            `Reintentando subida S3 MinIO (${attempt}/${maxS3Attempts}) en ${backoffSec}s tras: ${errMsg.slice(0, 120)}`
           );
+          if (statusMsgId) {
+            void editTelegramStatusMessage(
+              job.telegramChatId,
+              statusMsgId,
+              `${hudHeader("RECONECTANDO CON S3 PICTA")}
+` + hudBox([
+                `\u{1F3AC} <b>T\xEDtulo:</b> ${escapeHtml(job.title)}`,
+                `\u{1F504} <b>Reintento:</b> ${attempt + 1}/${maxS3Attempts} en ${backoffSec}s`,
+                `\u26A0\uFE0F <b>Motivo:</b> ${escapeHtml(errMsg.slice(0, 140))}`
+              ]) + `
+\u23F3 <i>Abriendo nueva conexi\xF3n limpia hacia videos.picta.cu...</i>`,
+              [[{ text: "\u{1F6D1} Cancelar subida", callback_data: `cancel_job:${job.id}` }]]
+            );
+          }
           await new Promise((r) => setTimeout(r, backoffSec * 1e3));
         } else {
           throw s3Err;
@@ -10162,7 +10296,7 @@ ${safeErrBlock}
         `\u{1F3AC} <b>T\xEDtulo:</b> ${escapeHtml(job.title)}`,
         `\u{1F4C2} <b>Categor\xEDa:</b> ${escapeHtml(job.category || "Audiovisual")}`,
         job.preferredUploadAccountLabel ? `\u{1F464} <b>Cuenta usada:</b> ${escapeHtml(job.preferredUploadAccountLabel)}` : void 0,
-        `\u{1F511} <b>Manifiesto S3:</b> <code>${escapeHtml(job.minioKey || "Pendiente")}</code>`
+        `\u{1F511} <b>Manifiesto S3:</b> <code>${escapeHtml(job.minioKey || (job.pendingMinioKey ? `${job.pendingMinioKey} (incompleto)` : "Pendiente"))}</code>`
       ]) + `
 ` + (roleDiagnosticNote ? `${roleDiagnosticNote}
 
@@ -10171,7 +10305,7 @@ ${safeErrBlock}
 ` : "") + `${hudSection("Detalle del error")}
 ${safeErrBlock}
 
-` + (roleDiagnosticNote ? `\u{1F4A1} <i>Tu video qued\xF3 guardado en S3 MinIO. Apenas soporte reactive el rol <b>Jefe de canal</b>, pulsa Reintentar.</i>` : job.minioKey ? `\u{1F4A1} <i>El video ya est\xE1 subido al 100% en S3 MinIO. Usa "Reintentar" o "Rellenar / Corregir Datos".</i>` : `\u{1F4A1} <i>Puedes reintentar el proceso con los botones inferiores.</i>`),
+` + (roleDiagnosticNote ? `\u{1F4A1} <i>Tu video qued\xF3 guardado en S3 MinIO. Apenas soporte reactive el rol <b>Jefe de canal</b>, pulsa Reintentar.</i>` : job.minioKey ? `\u{1F4A1} <i>El video ya est\xE1 subido al 100% en S3 MinIO. Usa "Reintentar" o "Rellenar / Corregir Datos".</i>` : `\u{1F4A1} <i>La subida a S3 MinIO no se complet\xF3. Pulsa "Reintentar" para volver a subir el archivo correctamente.</i>`),
       retryKeyboard,
       true
     );
@@ -10285,6 +10419,7 @@ async function runUploadStage(job) {
       throw new Error("SUBIDA_CANCELADA_POR_USUARIO");
     }
     let localFilePath = job.tempFilePath || "";
+    clearUnconfirmedGhostMinioKey(job);
     if (job.minioKey) {
       const autoRetryBadge = job.encoderRetryActive ? ` (Auto-reintento #${Math.max(1, job.encoderRetryCount || 1)}/${MAX_ENCODER_AUTO_RETRIES})` : "";
       const s3ReadyMsg = `${hudHeader("RETOMANDO DESDE S3 MINIO")}
@@ -17651,6 +17786,7 @@ async function promptUploadAccountSelection(job, chatId, messageId) {
 }
 async function startJobUploadWithSelectedAccount(job, chatId, messageId) {
   pendingManualTitleByChat.delete(chatId);
+  clearUnconfirmedGhostMinioKey(job);
   job.stage = job.minioKey ? "creating_picta_publication" : "generating_auto_title";
   job.errorDetails = void 0;
   job.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
@@ -19983,6 +20119,7 @@ Esta acci\xF3n eliminar\xE1 o retirar\xE1 el cap\xEDtulo/video de tu canal en Pi
       const job = transferJobs.find((j) => j.id === jobId);
       if (!job || !isMasterAdminChat(chatId2) && job.telegramChatId !== chatId2) return;
       if (messageId) job.statusMessageId = messageId;
+      clearUnconfirmedGhostMinioKey(job);
       job.preferredUploadAccountKey = void 0;
       job.preferredUploadAccountLabel = void 0;
       saveJobsToDisk();
@@ -20514,6 +20651,7 @@ Esta acci\xF3n eliminar\xE1 o retirar\xE1 el cap\xEDtulo/video de tu canal en Pi
       if (wasEncoderFailure) {
         job.encoderManualRetryTriggered = true;
       }
+      clearUnconfirmedGhostMinioKey(job);
       job.encoderRetryNextAt = 0;
       job.stage = job.minioKey ? "creating_picta_publication" : "generating_auto_title";
       job.errorDetails = void 0;
@@ -20631,6 +20769,7 @@ Esta acci\xF3n eliminar\xE1 o retirar\xE1 el cap\xEDtulo/video de tu canal en Pi
       if (messageId) {
         job.statusMessageId = messageId;
       }
+      clearUnconfirmedGhostMinioKey(job);
       job.preferredUploadAccountKey = void 0;
       job.preferredUploadAccountLabel = void 0;
       saveJobsToDisk();
@@ -24416,6 +24555,7 @@ async function startServer() {
       }
       let reQueuedCount = 0;
       for (const j of transferJobs) {
+        clearUnconfirmedGhostMinioKey(j);
         const isResumable = j.stage === "queued" || j.stage === "generating_auto_title" || j.stage === "downloading_mtproto" || j.stage === "verifying_integrity" || j.stage === "uploading_full_file_to_picta" || j.stage === "creating_picta_publication" || j.stage === "failed" && String(j.errorDetails || "").includes("503");
         if (isResumable) {
           if (j.stage !== "queued") {
