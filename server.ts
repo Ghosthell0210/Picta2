@@ -3577,6 +3577,10 @@ function syncPictaCommentsToChannelRequests(ownerChatId, comments, ownerUsername
 function getTodayCubaDateStr() {
   return getCubaTodayStr();
 }
+var QUEUE_TIMER_ALLOWED_MINUTES = [0, 5, 10, 15, 20, 30, 45, 60];
+var DEFAULT_QUEUE_SPACING_MINUTES = 20;
+var queueSpacingWakeupTimer = null;
+
 function loadQuotaSettingsFromDisk() {
   const today = getTodayCubaDateStr();
   try {
@@ -3584,6 +3588,7 @@ function loadQuotaSettingsFromDisk() {
       const parsed = JSON.parse(fs3.readFileSync(QUOTA_SETTINGS_FILE, "utf-8"));
       if (parsed && typeof parsed === "object") {
         const lastDate = String(parsed.lastResetDate || parsed.currentDateCuba || today);
+        const rawSpacing = typeof parsed.queueSpacingMinutes === "number" ? parsed.queueSpacingMinutes : DEFAULT_QUEUE_SPACING_MINUTES;
         return {
           maxSeriesPerDay: typeof parsed.maxSeriesPerDay === "number" ? parsed.maxSeriesPerDay : 7,
           seriesUploadedToday: Number(parsed.seriesUploadedToday || 0),
@@ -3591,7 +3596,10 @@ function loadQuotaSettingsFromDisk() {
           lastResetDate: lastDate,
           currentDateCuba: lastDate,
           primaryExhaustedDate: parsed.primaryExhaustedDate ? String(parsed.primaryExhaustedDate) : void 0,
-          poolAccounts: Array.isArray(parsed.poolAccounts) ? parsed.poolAccounts : []
+          poolAccounts: Array.isArray(parsed.poolAccounts) ? parsed.poolAccounts : [],
+          queueSpacingMinutes: Math.max(0, Math.min(180, Math.round(rawSpacing))),
+          queueHumanJitterEnabled: typeof parsed.queueHumanJitterEnabled === "boolean" ? parsed.queueHumanJitterEnabled : true,
+          nextUploadAllowedAtMs: Number(parsed.nextUploadAllowedAtMs || 0)
         };
       }
     }
@@ -3604,7 +3612,10 @@ function loadQuotaSettingsFromDisk() {
     otherUploadedToday: 0,
     lastResetDate: today,
     currentDateCuba: today,
-    poolAccounts: []
+    poolAccounts: [],
+    queueSpacingMinutes: DEFAULT_QUEUE_SPACING_MINUTES,
+    queueHumanJitterEnabled: true,
+    nextUploadAllowedAtMs: 0
   };
 }
 var quotaSettings = loadQuotaSettingsFromDisk();
@@ -3615,6 +3626,88 @@ function saveQuotaSettingsToDisk() {
     scheduleSaveCloudStateToTelegram();
   } catch {
   }
+}
+function computeEffectiveQueueSpacingMs(baseMinutes, jitterEnabled) {
+  const mins = Math.max(0, Number(baseMinutes || 0));
+  if (mins <= 0) return 0;
+  let totalMs = mins * 6e4;
+  if (jitterEnabled && mins >= 5) {
+    const maxJitterMs = Math.min(2 * 6e4, Math.floor(totalMs * 0.2));
+    const randomOffsetMs = Math.floor((Math.random() * 2 - 1) * maxJitterMs);
+    totalMs = Math.max(6e4, totalMs + randomOffsetMs);
+  }
+  return totalMs;
+}
+function getQueueTimerRemainingMs() {
+  const spacingMins = Number(quotaSettings.queueSpacingMinutes ?? DEFAULT_QUEUE_SPACING_MINUTES);
+  if (spacingMins <= 0) return 0;
+  const targetMs = Number(quotaSettings.nextUploadAllowedAtMs || 0);
+  if (targetMs <= 0) return 0;
+  return Math.max(0, targetMs - Date.now());
+}
+function isQueueTimerHoldingUpload() {
+  return getQueueTimerRemainingMs() > 1e3;
+}
+function formatCubaTimeAtMs(epochMs) {
+  try {
+    return new Intl.DateTimeFormat("es-CU", {
+      timeZone: "America/Havana",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: true
+    }).format(new Date(epochMs));
+  } catch {
+    return new Date(epochMs).toLocaleTimeString();
+  }
+}
+function formatRemainingQueueTimerLabel() {
+  const remMs = getQueueTimerRemainingMs();
+  if (remMs <= 0) return "0s";
+  const totalSec = Math.ceil(remMs / 1e3);
+  const mins = Math.floor(totalSec / 60);
+  const secs = totalSec % 60;
+  if (mins <= 0) return `${secs}s`;
+  return secs > 0 ? `${mins}m ${secs}s` : `${mins} min`;
+}
+function scheduleNextQueueSpacingWakeup() {
+  if (queueSpacingWakeupTimer) {
+    clearTimeout(queueSpacingWakeupTimer);
+    queueSpacingWakeupTimer = null;
+  }
+  const remMs = getQueueTimerRemainingMs();
+  if (remMs <= 0) return;
+  queueSpacingWakeupTimer = setTimeout(() => {
+    queueSpacingWakeupTimer = null;
+    if (Number(quotaSettings.nextUploadAllowedAtMs || 0) <= Date.now() + 500) {
+      quotaSettings.nextUploadAllowedAtMs = 0;
+      saveQuotaSettingsToDisk();
+    }
+    void scheduleTransferPipeline();
+  }, Math.min(2147483647, remMs + 150));
+}
+function armQueueUploadTimerAfterCompletion() {
+  const spacingMins = Number(quotaSettings.queueSpacingMinutes ?? DEFAULT_QUEUE_SPACING_MINUTES);
+  if (spacingMins <= 0) {
+    quotaSettings.nextUploadAllowedAtMs = 0;
+    saveQuotaSettingsToDisk();
+    return 0;
+  }
+  const jitterOn = quotaSettings.queueHumanJitterEnabled !== false;
+  const delayMs = computeEffectiveQueueSpacingMs(spacingMins, jitterOn);
+  quotaSettings.nextUploadAllowedAtMs = Date.now() + delayMs;
+  saveQuotaSettingsToDisk();
+  scheduleNextQueueSpacingWakeup();
+  return delayMs;
+}
+function skipQueueUploadTimerNow() {
+  if (queueSpacingWakeupTimer) {
+    clearTimeout(queueSpacingWakeupTimer);
+    queueSpacingWakeupTimer = null;
+  }
+  quotaSettings.nextUploadAllowedAtMs = 0;
+  saveQuotaSettingsToDisk();
+  void scheduleTransferPipeline();
 }
 function ensureDailyQuotaReset() {
   const today = getTodayCubaDateStr();
@@ -3656,6 +3749,7 @@ function ensureDailyQuotaReset() {
   if (userPoolChanged) {
     saveUserSessionsToDisk();
   }
+  return changed || userPoolChanged;
 }
 var pendingPoolAccountByChat = /* @__PURE__ */ new Map();
 var pendingPictaSearchByChat = /* @__PURE__ */ new Map();
@@ -7240,23 +7334,113 @@ async function resetAndReconnectMtprotoClient(reason) {
 }
 async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onProgress, jobId, peerId, messageId) {
   const CHUNK_TIMEOUT_MS = 22e3;
-  const fileHandle = await fs3.promises.open(outputFilePath, "w+");
-  if (totalBytes > 0) {
-    await fileHandle.truncate(totalBytes).catch(() => {
-    });
-  }
-  let currentDcId = Number(doc.dcId) || 1;
-  let currentFileReference = Buffer.isBuffer(doc.fileReference) ? doc.fileReference : Buffer.from(doc.fileReference || []);
-  let force512KbMode = false;
-  const pendingQueue = buildDirectDownloadChunks(
+  const MAX_WRITE_BEHIND_BYTES = 16 * 1024 * 1024;
+  const checkpointFilePath = `${outputFilePath}.part.json`;
+  const allChunks = buildDirectDownloadChunks(
     totalBytes,
     MTPROTO_TURBO_CHUNK_BYTES
   );
-  const initialQueueLen = pendingQueue.length;
-  let downloadedBytes = 0;
+  const completedOffsetsSet = /* @__PURE__ */ new Set();
+  let resumedBytesFromDisk = 0;
+  let canResumeExistingPart = false;
+  try {
+    if (totalBytes > 0 && fs3.existsSync(outputFilePath) && fs3.existsSync(checkpointFilePath)) {
+      const partStat = fs3.statSync(outputFilePath);
+      const rawMeta = JSON.parse(fs3.readFileSync(checkpointFilePath, "utf-8"));
+      if (partStat.size === totalBytes && rawMeta && Number(rawMeta.totalBytes) === totalBytes && Number(rawMeta.chunkSize) === MTPROTO_TURBO_CHUNK_BYTES && Array.isArray(rawMeta.completedOffsets)) {
+        for (const off of rawMeta.completedOffsets) {
+          const n = Number(off);
+          if (Number.isFinite(n) && n >= 0 && n < totalBytes) {
+            completedOffsetsSet.add(n);
+          }
+        }
+        if (completedOffsetsSet.size > 0 && completedOffsetsSet.size < allChunks.length) {
+          canResumeExistingPart = true;
+        }
+      }
+    }
+  } catch {
+  }
+  const fileHandle = await fs3.promises.open(outputFilePath, canResumeExistingPart ? "r+" : "w+");
+  if (!canResumeExistingPart && totalBytes > 0) {
+    await fileHandle.truncate(totalBytes).catch(() => {
+    });
+  }
+  const pendingQueue = [];
+  for (const ch of allChunks) {
+    if (canResumeExistingPart && completedOffsetsSet.has(ch.offset)) {
+      resumedBytesFromDisk += ch.expectedBytes;
+    } else {
+      pendingQueue.push(ch);
+    }
+  }
+  if (canResumeExistingPart && resumedBytesFromDisk > 0) {
+    addLiveLog(
+      "mtproto",
+      "info",
+      `Reanudando descarga MTProto desde checkpoint en disco: ${formatBytes(resumedBytesFromDisk)} / ${formatBytes(totalBytes)} ya verificados (${pendingQueue.length} bloques restantes).`
+    );
+  }
+  let lastCheckpointSaveMs = 0;
+  let checkpointSaveInFlight = false;
+  const persistChunkCheckpointToDisk = (forceSync = false) => {
+    if (totalBytes <= 0 || completedOffsetsSet.size === 0) return;
+    const now = Date.now();
+    if (!forceSync && (checkpointSaveInFlight || now - lastCheckpointSaveMs < 1800)) return;
+    lastCheckpointSaveMs = now;
+    const payload = JSON.stringify({
+      totalBytes,
+      chunkSize: MTPROTO_TURBO_CHUNK_BYTES,
+      updatedAt: new Date(now).toISOString(),
+      completedOffsets: Array.from(completedOffsetsSet)
+    });
+    if (forceSync) {
+      try {
+        fs3.writeFileSync(checkpointFilePath, payload, "utf-8");
+      } catch {
+      }
+      return;
+    }
+    checkpointSaveInFlight = true;
+    fs3.promises.writeFile(checkpointFilePath, payload, "utf-8").catch(() => {
+    }).finally(() => {
+      checkpointSaveInFlight = false;
+    });
+  };
+  let currentDcId = Number(doc.dcId) || 1;
+  let currentFileReference = Buffer.isBuffer(doc.fileReference) ? doc.fileReference : Buffer.from(doc.fileReference || []);
+  let force512KbMode = false;
+  const initialQueueLen = Math.max(1, pendingQueue.length);
+  let downloadedBytes = resumedBytesFromDisk;
   let fatalError = null;
-  let reconnectingPromise = null;
+  const slotReconnectingPromises = [];
   let refreshingFileRefPromise = null;
+  let pendingWriteBytes = 0;
+  let diskWriteError = null;
+  const pendingWritePromises = /* @__PURE__ */ new Set();
+  const enqueueChunkDiskWrite = async (buf, offset, isFullTopLevelChunk) => {
+    pendingWriteBytes += buf.length;
+    const writeTask = fileHandle.write(buf, 0, buf.length, offset).then(() => {
+      if (isFullTopLevelChunk) {
+        completedOffsetsSet.add(offset);
+        persistChunkCheckpointToDisk(false);
+      }
+    }).catch((wErr) => {
+      if (!diskWriteError) {
+        diskWriteError = wErr instanceof Error ? wErr : new Error(String(wErr));
+      }
+    }).finally(() => {
+      pendingWriteBytes = Math.max(0, pendingWriteBytes - buf.length);
+      pendingWritePromises.delete(writeTask);
+    });
+    pendingWritePromises.add(writeTask);
+    if (pendingWriteBytes >= MAX_WRITE_BEHIND_BYTES) {
+      await Promise.race(pendingWritePromises);
+    }
+    if (diskWriteError) {
+      throw diskWriteError;
+    }
+  };
   const cancelAbort = new AbortController();
   const cancelMonitor = jobId ? setInterval(() => {
     if (cancelledJobIds.has(jobId)) {
@@ -7282,7 +7466,7 @@ async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onP
   let telemetryTimer = null;
   const downloadStartTimeMs = Date.now();
   let lastWindowTimeMs = downloadStartTimeMs;
-  let lastWindowBytes = 0;
+  let lastWindowBytes = downloadedBytes;
   let lastCpuUsage = process.cpuUsage();
   const getActiveSocketCount = () => {
     let active = 0;
@@ -7297,7 +7481,8 @@ async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onP
     const dBytes = Math.max(0, downloadedBytes - lastWindowBytes);
     const windowMBpsNum = Number((dBytes / (1024 * 1024) / dtSec).toFixed(2));
     const totalSec = Math.max(0.25, (now - downloadStartTimeMs) / 1e3);
-    const avgTotalMBpsNum = Number((downloadedBytes / (1024 * 1024) / totalSec).toFixed(2));
+    const netDownloadedBytes = Math.max(0, downloadedBytes - resumedBytesFromDisk);
+    const avgTotalMBpsNum = Number((netDownloadedBytes / (1024 * 1024) / totalSec).toFixed(2));
     const cpuDelta = process.cpuUsage(lastCpuUsage);
     lastCpuUsage = process.cpuUsage();
     const cpuPct = Math.round((cpuDelta.user + cpuDelta.system) / 1e3 / (dtSec * 1e3) * 100);
@@ -7331,17 +7516,68 @@ async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onP
     }
   };
   try {
-    const resolveClientSenderForDc = async (targetClient, targetDcId) => {
+    const resolveClientSenderForDc = async (targetClient, targetDcId, forceFreshExport = false) => {
+      if (!targetClient) return null;
+      if (!targetClient.connected) {
+        try {
+          await targetClient.connect();
+        } catch {
+        }
+      }
       const homeDcId = Number(targetClient.session?.dcId) || void 0;
       if (shouldUseMainClientSenderForPrimarySlot(targetDcId, homeDcId)) {
-        return targetClient._sender || await targetClient.getSender(void 0);
+        const mainSender = targetClient._sender || await targetClient.getSender(void 0);
+        if (mainSender && !mainSender.isConnected?.() && typeof mainSender.connect === "function") {
+          try {
+            await mainSender.connect();
+          } catch {
+          }
+        }
+        return mainSender;
+      }
+      clearExportedSenderReleaseTimer(targetClient, targetDcId);
+      const exportedMap = targetClient._exportedSenders;
+      const borrowedPromises = targetClient._borrowedSenderPromises;
+      const cachedExported = exportedMap && typeof exportedMap.get === "function" ? exportedMap.get(targetDcId) : null;
+      if (forceFreshExport || cachedExported && !cachedExported.isConnected?.()) {
+        let reconnectedCached = false;
+        if (!forceFreshExport && cachedExported && typeof cachedExported.connect === "function") {
+          try {
+            await cachedExported.connect();
+            reconnectedCached = Boolean(cachedExported.isConnected?.());
+          } catch {
+            reconnectedCached = false;
+          }
+        }
+        if (!reconnectedCached) {
+          try {
+            if (cachedExported && typeof cachedExported.disconnect === "function") {
+              await cachedExported.disconnect().catch(() => {
+              });
+            }
+          } catch {
+          }
+          if (exportedMap && typeof exportedMap.delete === "function") {
+            exportedMap.delete(targetDcId);
+          }
+          if (borrowedPromises && typeof borrowedPromises.delete === "function") {
+            borrowedPromises.delete(targetDcId);
+          }
+        }
       }
       const exported = await targetClient.getSender(targetDcId);
       clearExportedSenderReleaseTimer(targetClient, targetDcId);
+      if (exported && !exported.isConnected?.() && typeof exported.connect === "function") {
+        try {
+          await exported.connect();
+        } catch {
+        }
+      }
       return exported;
     };
     senderSlots[0] = await resolveClientSenderForDc(client, currentDcId);
     healthyFlags[0] = Boolean(senderSlots[0]);
+    slotReconnectingPromises[0] = null;
     leaseKeepaliveTimer = setInterval(() => {
       for (let i = 0; i < slotClients.length; i++) {
         if (slotClients[i] && !slotDisabled[i]) {
@@ -7371,11 +7607,12 @@ async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onP
             slotClients.push(auxClient);
             senderSlots.push(auxSender);
             inFlightCounts.push(0);
-            healthyFlags.push(true);
+            healthyFlags.push(Boolean(auxSender.isConnected?.() !== false));
             slotDisabled.push(false);
             slotConsecutiveErrors.push(0);
             slotChunkCounts.push(0);
             slotLoggedFirstError.push(false);
+            slotReconnectingPromises.push(null);
           } catch (auxErr) {
             addMtprotoDiagLog({
               level: "warn",
@@ -7392,44 +7629,41 @@ async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onP
           dcId: currentDcId,
           activeSockets: activeNow,
           maxSockets: desiredTotalSockets,
-          message: `Pool MTProto DC #${currentDcId}: ${activeNow}/${desiredTotalSockets} sesiones TCP independientes activas (${Math.min(MTPROTO_SAFE_PARALLEL_WORKERS, Math.max(1, initialQueueLen))} hilos x 1 MB \xB7 FastSocket).`
+          message: `Pool MTProto DC #${currentDcId}: ${activeNow}/${desiredTotalSockets} sesiones TCP independientes activas (${Math.min(MTPROTO_SAFE_PARALLEL_WORKERS, Math.max(1, initialQueueLen))} hilos x 1 MB \xB7 FastSocket + WriteBehind).`
         });
       }
     };
     await Promise.race([
       warmAuxiliarySlots(),
-      new Promise((resolve) => setTimeout(resolve, 1500))
+      new Promise((resolve) => setTimeout(resolve, 3e3))
     ]);
-    const renewPrimaryDcSender = async (forceReconnect = false) => {
-      const homeDcId = Number(client.session?.dcId) || void 0;
-      const isHomeDc = shouldUseMainClientSenderForPrimarySlot(currentDcId, homeDcId);
-      const primary = senderSlots[0];
-      if (!forceReconnect && primary && primary.isConnected?.()) {
-        if (isHomeDc) {
-          return primary;
-        }
-        try {
-          senderSlots[0] = await client.getSender(currentDcId);
-          healthyFlags[0] = true;
-          return senderSlots[0];
-        } catch {
-        }
+    const renewSlotDcSender = async (slotIdx, forceReconnect = false) => {
+      const targetClient = slotClients[slotIdx] || (slotIdx === 0 ? client : null);
+      if (!targetClient || slotDisabled[slotIdx]) return null;
+      const existingSender = senderSlots[slotIdx];
+      const transportUp = existingSender?._connection ? existingSender._connection.isConnected?.() !== false : true;
+      if (!forceReconnect && existingSender && existingSender.isConnected?.() && !existingSender.isReconnecting && transportUp) {
+        healthyFlags[slotIdx] = true;
+        return existingSender;
       }
-      if (reconnectingPromise) {
-        return reconnectingPromise;
+      if (slotReconnectingPromises[slotIdx]) {
+        return slotReconnectingPromises[slotIdx];
       }
-      reconnectingPromise = (async () => {
+      slotReconnectingPromises[slotIdx] = (async () => {
         try {
-          senderSlots[0] = await resolveClientSenderForDc(client, currentDcId);
-          healthyFlags[0] = Boolean(senderSlots[0]);
-          return senderSlots[0];
+          const freshSender = await resolveClientSenderForDc(targetClient, currentDcId, forceReconnect);
+          senderSlots[slotIdx] = freshSender;
+          const isOk = Boolean(freshSender && freshSender.isConnected?.() !== false);
+          healthyFlags[slotIdx] = isOk;
+          return isOk ? freshSender : null;
         } catch {
-          return senderSlots[0];
+          healthyFlags[slotIdx] = false;
+          return null;
         } finally {
-          reconnectingPromise = null;
+          slotReconnectingPromises[slotIdx] = null;
         }
       })();
-      return reconnectingPromise;
+      return slotReconnectingPromises[slotIdx];
     };
     const refreshFileReferenceSafe = async () => {
       if (!peerId || !messageId) return;
@@ -7505,9 +7739,13 @@ async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onP
               const sObj = senderSlots[sIdx];
               const sClient = slotClients[sIdx];
               const transportUp = sObj?._connection ? sObj._connection.isConnected?.() !== false : true;
-              healthyFlags[sIdx] = Boolean(
+              const isSlotUp = Boolean(
                 sObj && sClient && sObj.isConnected?.() && !sObj.isReconnecting && transportUp
               );
+              if (!isSlotUp && sClient && !slotReconnectingPromises[sIdx]) {
+                void renewSlotDcSender(sIdx, true);
+              }
+              healthyFlags[sIdx] = isSlotUp;
             }
             chosenSlotIdx = selectLeastBusySenderSlot(
               inFlightCounts,
@@ -7516,10 +7754,13 @@ async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onP
             );
             let slotClient = slotClients[chosenSlotIdx] || client;
             let sender = senderSlots[chosenSlotIdx];
+            if (chosenSlotIdx > 0 && !slotDisabled[chosenSlotIdx] && (!sender || !sender.isConnected?.())) {
+              sender = await renewSlotDcSender(chosenSlotIdx, true);
+            }
             if (chosenSlotIdx === 0 || slotDisabled[chosenSlotIdx] || !sender || !sender.isConnected?.()) {
               chosenSlotIdx = 0;
               slotClient = client;
-              sender = await renewPrimaryDcSender(false);
+              sender = await renewSlotDcSender(0, false);
             }
             inFlightCounts[chosenSlotIdx] = (inFlightCounts[chosenSlotIdx] || 0) + 1;
             const req = new Api.upload.GetFile({
@@ -7551,7 +7792,8 @@ async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onP
               if (buf.length === 0) {
                 throw new Error("Respuesta de bytes vac\xEDa de Telegram");
               }
-              await fileHandle.write(buf, 0, buf.length, chunk.offset);
+              const isCompleteTopChunk = !force512KbMode && chunk.requestLimit === MTPROTO_TURBO_CHUNK_BYTES && buf.length >= chunk.expectedBytes;
+              await enqueueChunkDiskWrite(buf, chunk.offset, isCompleteTopChunk);
               downloadedBytes += buf.length;
               slotChunkCounts[chosenSlotIdx] = (slotChunkCounts[chosenSlotIdx] || 0) + 1;
               slotConsecutiveErrors[chosenSlotIdx] = 0;
@@ -7599,7 +7841,7 @@ async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onP
                 message: `Socket s${chosenSlotIdx} error en DC #${currentDcId} (${classified.kind}): ${rawErrMsg}`
               });
             }
-            if (chosenSlotIdx > 0 && (classified.kind === "fatal_auth" || slotConsecutiveErrors[chosenSlotIdx] >= 3)) {
+            if (chosenSlotIdx > 0 && (classified.kind === "fatal_auth" || slotConsecutiveErrors[chosenSlotIdx] >= 4)) {
               if (!slotDisabled[chosenSlotIdx]) {
                 slotDisabled[chosenSlotIdx] = true;
                 healthyFlags[chosenSlotIdx] = false;
@@ -7645,19 +7887,13 @@ async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onP
               for (let sIdx = 1; sIdx < senderSlots.length; sIdx++) {
                 if (slotDisabled[sIdx]) continue;
                 try {
-                  const auxC = slotClients[sIdx];
-                  if (auxC && auxC.connected) {
-                    senderSlots[sIdx] = await resolveClientSenderForDc(auxC, currentDcId);
-                    healthyFlags[sIdx] = Boolean(senderSlots[sIdx]);
-                  } else {
-                    healthyFlags[sIdx] = false;
-                  }
+                  await renewSlotDcSender(sIdx, true);
                 } catch {
                   healthyFlags[sIdx] = false;
                 }
               }
               attempt = Math.max(0, attempt - 1);
-              await renewPrimaryDcSender(true);
+              await renewSlotDcSender(0, true);
               continue;
             }
             if (classified.kind === "limit_invalid" && chunk.requestLimit > MTPROTO_FALLBACK_CHUNK_BYTES) {
@@ -7671,11 +7907,7 @@ async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onP
               await refreshFileReferenceSafe();
             }
             if (classified.kind === "transient_network") {
-              if (chosenSlotIdx > 0) {
-                healthyFlags[chosenSlotIdx] = false;
-              } else {
-                await renewPrimaryDcSender(true);
-              }
+              await renewSlotDcSender(chosenSlotIdx, true);
             }
             if (attempt >= 10) {
               fatalError = err instanceof Error ? err : new Error(classified.message);
@@ -7694,10 +7926,26 @@ async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onP
     };
     const workerCount = Math.min(MTPROTO_SAFE_PARALLEL_WORKERS, Math.max(1, initialQueueLen));
     await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    if (pendingWritePromises.size > 0) {
+      await Promise.allSettled(Array.from(pendingWritePromises));
+    }
+    if (diskWriteError && !fatalError) {
+      fatalError = diskWriteError;
+    }
     if (fatalError) {
+      persistChunkCheckpointToDisk(true);
       throw fatalError;
     }
+    try {
+      if (fs3.existsSync(checkpointFilePath)) {
+        fs3.unlinkSync(checkpointFilePath);
+      }
+    } catch {
+    }
   } finally {
+    if (pendingWritePromises.size > 0) {
+      await Promise.allSettled(Array.from(pendingWritePromises));
+    }
     if (completedChunks > 0) {
       emitTelemetrySnapshot(fatalError ? "Resumen (interrumpido)" : "Resumen");
     }
@@ -7712,7 +7960,7 @@ async function downloadFullVideoFromTelegram(job, statusMsgId) {
   const safeExt = path3.extname(job.fileName) || ".mp4";
   const targetFilePath = path3.join(TMP_UPLOAD_DIR, `${job.id}${safeExt}`);
   job.tempFilePath = targetFilePath;
-  if (job.expectedBytes > 0 && fs3.existsSync(targetFilePath) && fs3.statSync(targetFilePath).size === job.expectedBytes) {
+  if (job.expectedBytes > 0 && fs3.existsSync(targetFilePath) && fs3.statSync(targetFilePath).size === job.expectedBytes && !fs3.existsSync(`${targetFilePath}.part.json`)) {
     job.downloadedBytes = job.expectedBytes;
     job.diskVerifiedBytes = job.expectedBytes;
     job.integrityVerified = true;
@@ -7855,6 +8103,29 @@ async function downloadFullVideoFromTelegram(job, statusMsgId) {
       throw err;
     } finally {
       clearInterval(cancelWatch);
+    }
+  }
+  if (job.expectedBytes > 0 && job.expectedBytes <= 20 * 1024 * 1024 && job.fileId && !job.sourceType) {
+    try {
+      const fastStartMs = Date.now();
+      const fastBuf = await downloadTelegramThumbnailBuffer(job.fileId);
+      if (fastBuf && fastBuf.byteLength === job.expectedBytes) {
+        fs3.writeFileSync(targetFilePath, fastBuf);
+        const fastDurSec = Math.max(0.2, (Date.now() - fastStartMs) / 1e3);
+        job.downloadedBytes = fastBuf.byteLength;
+        job.diskVerifiedBytes = fastBuf.byteLength;
+        job.integrityVerified = true;
+        job.speedMBps = Number((fastBuf.byteLength / (1024 * 1024) / fastDurSec).toFixed(2));
+        job.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
+        saveJobsToDisk();
+        addLiveLog(
+          "telegram",
+          "info",
+          `V\xEDa R\xE1pida HTTPS Bot API completada (${job.speedMBps} MB/s): "${job.fileName}" (${formatBytes(fastBuf.byteLength)}).`
+        );
+        return targetFilePath;
+      }
+    } catch {
     }
   }
   let client = await ensureMtprotoClient();
@@ -9349,8 +9620,10 @@ function getProtectedScratchPaths(excludeJobId) {
   for (const j of transferJobs) {
     if (!j || !j.tempFilePath || j.id === excludeJobId) continue;
     const isStagedQueued = j.stage === "queued" && !j.minioKey && Boolean(j.integrityVerified) && (j.expectedBytes === 0 || j.diskVerifiedBytes === j.expectedBytes);
-    if (protectedIds.has(j.id) || isStagedQueued) {
+    const hasResumablePart = (j.stage === "queued" || j.stage === "downloading_mtproto") && fs3.existsSync(`${j.tempFilePath}.part.json`);
+    if (protectedIds.has(j.id) || isStagedQueued || hasResumablePart) {
       protectedSet.add(j.tempFilePath);
+      protectedSet.add(`${j.tempFilePath}.part.json`);
     }
   }
   return protectedSet;
@@ -9386,6 +9659,7 @@ function removeJobFromUploadQueue(jobId) {
   }
 }
 function startCloudRunCpuKeepAlive() {
+  if (!process.env.K_SERVICE && !process.env.CLOUD_RUN_JOB) return;
   if (keepAliveActive) return;
   const targetUrl = detectCloudRunUrl();
   if (!targetUrl || !targetUrl.startsWith("http")) return;
@@ -9508,9 +9782,10 @@ async function handleJobPipelineFailure(job, statusMsgId, err) {
     job.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
     currentActivity = `Subida cancelada por usuario: "${job.title}"`;
     saveJobsToDisk();
-    if (job.tempFilePath && fs3.existsSync(job.tempFilePath)) {
+    if (job.tempFilePath) {
       try {
-        fs3.unlinkSync(job.tempFilePath);
+        if (fs3.existsSync(job.tempFilePath)) fs3.unlinkSync(job.tempFilePath);
+        if (fs3.existsSync(`${job.tempFilePath}.part.json`)) fs3.unlinkSync(`${job.tempFilePath}.part.json`);
       } catch {
       }
     }
@@ -9864,6 +10139,22 @@ async function runDownloadStage(job) {
     if (!job.minioKey) {
       const localFilePath = await downloadFullVideoFromTelegram(job, statusMsgId);
       verifyCompleteFileOnDisk(job, localFilePath);
+      const timerHoldNow = !activeUploadJobId && isQueueTimerHoldingUpload();
+      const stage2Note = timerHoldNow ? `\u23F1\uFE0F <b>Modo Subida Humana (${quotaSettings.queueSpacingMinutes} min):</b> Descarga lista en disco. Subida a Picta programada en <b>${formatRemainingQueueTimerLabel()}</b> (<b>${formatCubaTimeAtMs(quotaSettings.nextUploadAllowedAtMs)}</b> hora Cuba).` : `\u23F3 <i>Listo para transmitir a Picta${activeUploadJobId ? " (esperando turno S3)" : ""}...</i>`;
+      const stage2Kb = timerHoldNow ? [
+        [
+          {
+            text: "\u26A1 Saltar Temporizador (Subir Ahora)",
+            callback_data: "queue_timer:skip"
+          }
+        ],
+        [
+          {
+            text: "\u{1F4CB} Ver Cola (/cola)",
+            callback_data: "queue_view"
+          }
+        ]
+      ] : void 0;
       await editTelegramStatusMessage(
         job.telegramChatId,
         statusMsgId,
@@ -9873,8 +10164,8 @@ async function runDownloadStage(job) {
           `\u{1F4CA} <b>Estado:</b> <code>${renderVisualBar(100)}</code>`,
           `\u{1F4E6} <b>Archivo \xEDntegro:</b> ${formatBytes(job.diskVerifiedBytes)}`
         ]) + `
-\u23F3 <i>Listo para transmitir a Picta${activeUploadJobId ? " (esperando turno S3)" : ""}...</i>`,
-        void 0,
+${stage2Note}`,
+        stage2Kb,
         true
       );
     }
@@ -9963,6 +10254,14 @@ async function runUploadStage(job) {
       job.telegramChatId,
       MASTER_ADMIN_CHAT_ID
     ).length;
+    const totalPendingQueueCount = uploadQueue.filter((id) => id !== job.id).length;
+    let armedSpacingDelayMs = 0;
+    if (totalPendingQueueCount > 0) {
+      armedSpacingDelayMs = armQueueUploadTimerAfterCompletion();
+    } else {
+      quotaSettings.nextUploadAllowedAtMs = 0;
+      saveQuotaSettingsToDisk();
+    }
     const compKeyboard = [];
     if (job.pictaPublicationId) {
       const slug = String(job.modelMetadata?.pictaSlugUrl || "").trim();
@@ -9977,6 +10276,24 @@ async function runUploadStage(job) {
         }
       ]);
     }
+    if (remainingUserQueue > 0 && armedSpacingDelayMs > 0) {
+      compKeyboard.push([
+        {
+          text: "\u26A1 Saltar Temporizador (Subir Ahora)",
+          callback_data: "queue_timer:skip"
+        },
+        {
+          text: "\u{1F4CB} Ver Cola (/cola)",
+          callback_data: "queue_view"
+        }
+      ]);
+    }
+    const nextQueueFooter = remainingUserQueue > 0 ? armedSpacingDelayMs > 0 ? `
+
+\u23F1\uFE0F <b>Modo Subida Humana (${quotaSettings.queueSpacingMinutes} min):</b> Siguiente video en cola (${remainingUserQueue} restante(s)) programado en <b>${formatRemainingQueueTimerLabel()}</b> (<b>${formatCubaTimeAtMs(quotaSettings.nextUploadAllowedAtMs)}</b> hora Cuba).
+<i>(Mientras tanto se pre-descargar\xE1 en segundo plano \xB7 Pulsa "Saltar Temporizador" abajo si deseas subirlo ya)</i>` : `
+
+\u23ED\uFE0F <i>Iniciando siguiente video en cola (${remainingUserQueue} restante(s))...</i>` : "";
     await editTelegramStatusMessage(
       job.telegramChatId,
       statusMsgId,
@@ -9989,9 +10306,7 @@ async function runUploadStage(job) {
         `\u{1F4E6} <b>Tama\xF1o \xEDntegro:</b> ${formatBytes(job.diskVerifiedBytes || job.expectedBytes)}`,
         `\u{1F511} <b>Manifiesto S3:</b> <code>${escapeHtml(job.minioKey || "OK")}</code>`
       ]) + `
-\u{1F4DD} <i>${escapeHtml(job.synopsis.slice(0, 220))}</i>` + (remainingUserQueue > 0 ? `
-
-\u23ED\uFE0F <i>Iniciando siguiente video en cola (${remainingUserQueue} restante(s))...</i>` : ""),
+\u{1F4DD} <i>${escapeHtml(job.synopsis.slice(0, 220))}</i>` + nextQueueFooter,
       compKeyboard,
       true
     );
@@ -10046,7 +10361,11 @@ async function scheduleTransferPipeline() {
       if (nextUpload) {
         const jobObj = transferJobs.find((j) => j.id === nextUpload.id);
         if (jobObj && !runningJobIds.has(jobObj.id)) {
-          void runUploadStage(jobObj);
+          if (isQueueTimerHoldingUpload() && !jobObj.encoderRetryActive) {
+            scheduleNextQueueSpacingWakeup();
+          } else {
+            void runUploadStage(jobObj);
+          }
         }
       }
     }
@@ -10087,9 +10406,10 @@ async function cancelTransferJob(jobId, chatId, messageId) {
   job.encoderManualRetryTriggered = false;
   job.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
   saveJobsToDisk();
-  if (job.tempFilePath && fs3.existsSync(job.tempFilePath)) {
+  if (job.tempFilePath) {
     try {
-      fs3.unlinkSync(job.tempFilePath);
+      if (fs3.existsSync(job.tempFilePath)) fs3.unlinkSync(job.tempFilePath);
+      if (fs3.existsSync(`${job.tempFilePath}.part.json`)) fs3.unlinkSync(`${job.tempFilePath}.part.json`);
     } catch {
     }
   }
@@ -10118,6 +10438,49 @@ async function cancelTransferJob(jobId, chatId, messageId) {
   void scheduleTransferPipeline();
   return true;
 }
+async function sendOrEditQueueTimerMenuInTelegram(chatId, messageId, replyToMessageId, notice) {
+  const curMins = Number(quotaSettings.queueSpacingMinutes ?? DEFAULT_QUEUE_SPACING_MINUTES);
+  const jitterOn = quotaSettings.queueHumanJitterEnabled !== false;
+  const holdingNow = isQueueTimerHoldingUpload();
+  const remLabel = holdingNow ? formatRemainingQueueTimerLabel() : null;
+  const nextCubaTime = holdingNow ? formatCubaTimeAtMs(quotaSettings.nextUploadAllowedAtMs) : null;
+  const text = (notice ? `${notice}\n\n` : "") + `${hudHeader("TEMPORIZADOR ANTI-SOSPECHA EN COLA")}
+` + hudBox([
+    `\u23F1\uFE0F <b>Intervalo entre subidas:</b> ${curMins > 0 ? `<b>${curMins} minutos</b>` : "<b>Desactivado (0 min \xB7 Subida continua)</b>"}`,
+    `\u{1F3B2} <b>Variaci\xF3n Humana (\xB12 min):</b> ${jitterOn ? "\u{1F7E2} <b>Activa</b> (evita intervalos rob\xF3ticos exactos)" : "\u26AA <i>Inactiva</i> (intervalo exacto)"}`,
+    holdingNow ? `\u23F3 <b>Cuenta regresiva activa:</b> Faltan <b>${remLabel}</b> (sube a las <b>${nextCubaTime}</b> hora Cuba)` : `\u{1F7E2} <b>Estado actual:</b> Sin espera activa (el pr\xF3ximo video inicia de inmediato)`
+  ]) + `
+\u{1F4A1} <i>Cuando env\xEDas una cola de varios archivos, el bot pre-descarga el siguiente video al disco pero espera este temporizador antes de publicarlo en Picta para simular subidas manuales humanas. Siempre puedes saltar la espera con 1 clic.</i>`;
+  const row1 = [0, 5, 10, 15].map((m) => ({
+    text: `${curMins === m ? "\u2705 " : ""}${m === 0 ? "OFF (0m)" : `${m} min`}`,
+    callback_data: `queue_timer:set:${m}`
+  }));
+  const row2 = [20, 30, 45, 60].map((m) => ({
+    text: `${curMins === m ? "\u2705 " : ""}${m} min`,
+    callback_data: `queue_timer:set:${m}`
+  }));
+  const keyboard = [row1, row2];
+  keyboard.push([
+    {
+      text: jitterOn ? "\u{1F3B2} Variaci\xF3n Humana (\xB12 min): ACTIVA" : "\u{1F3B2} Variaci\xF3n Humana (\xB12 min): INACTIVA",
+      callback_data: "queue_timer:jitter"
+    }
+  ]);
+  if (holdingNow) {
+    keyboard.push([
+      {
+        text: `\u26A1 Saltar Temporizador Ahora (Faltan ${remLabel})`,
+        callback_data: "queue_timer:skip"
+      }
+    ]);
+  }
+  keyboard.push([{ text: "\u2B05\uFE0F Volver a la Cola (/cola)", callback_data: "queue_view" }]);
+  if (messageId) {
+    await editTelegramStatusMessage(chatId, messageId, text, keyboard, true);
+  } else {
+    await sendTelegramStatusMessage(chatId, text, replyToMessageId, keyboard);
+  }
+}
 async function sendOrEditQueueManagerInTelegram(chatId, messageId, replyToMessageId, notice) {
   const isMaster = isMasterAdminChat(chatId);
   const session = userSessions.get(chatId);
@@ -10140,12 +10503,13 @@ async function sendOrEditQueueManagerInTelegram(chatId, messageId, replyToMessag
   }
   const activeUploadJob = activeUploadJobId ? transferJobs.find((j) => Boolean(j) && j.id === activeUploadJobId && (isMaster || j.telegramChatId === chatId)) : null;
   const activeDownloadJob = activeDownloadJobId && activeDownloadJobId !== activeUploadJobId ? transferJobs.find((j) => Boolean(j) && j.id === activeDownloadJobId && (isMaster || j.telegramChatId === chatId)) : null;
-  const activeJob = activeUploadJob || activeDownloadJob;
   const queuedJobs = uploadQueue.filter((id) => id !== activeUploadJobId && id !== activeDownloadJobId).map((id) => transferJobs.find((j) => Boolean(j) && j.id === id)).filter((j) => Boolean(j)).filter((j) => isMaster || j.telegramChatId === chatId);
   const encoderWaitingJobs = queuedJobs.filter((j) => Boolean(j.encoderRetryActive));
   const normalQueuedJobs = queuedJobs.filter((j) => !j.encoderRetryActive);
   const pinned = pinnedBatchSerieByChat.get(chatId);
   const channelTag = isMaster ? "MULTIVERSO VISUAL (#36319)" : escapeHtml((session?.channelName || "MI CANAL").toUpperCase());
+  const curTimerMins = Number(quotaSettings.queueSpacingMinutes ?? DEFAULT_QUEUE_SPACING_MINUTES);
+  const timerHoldingNow = !activeUploadJob && isQueueTimerHoldingUpload() && normalQueuedJobs.length > 0;
   let activeBlock = "";
   if (activeUploadJob) {
     activeBlock += `${hudSection("Subiendo a S3 Picta")}
@@ -10165,8 +10529,20 @@ async function sendOrEditQueueManagerInTelegram(chatId, messageId, replyToMessag
     ]) + `
 `;
   }
+  if (timerHoldingNow) {
+    const nextReadyJob = normalQueuedJobs[0];
+    const isPreDownloaded = Boolean(nextReadyJob && nextReadyJob.integrityVerified && nextReadyJob.tempFilePath && fs3.existsSync(nextReadyJob.tempFilePath));
+    activeBlock += `${hudSection("Temporizador Anti-Sospecha Activo")}
+` + hudBox([
+      `\u23F1\uFE0F <b>Pr\xF3xima subida en:</b> <b>${formatRemainingQueueTimerLabel()}</b> (<b>${formatCubaTimeAtMs(quotaSettings.nextUploadAllowedAtMs)}</b> hora Cuba)`,
+      nextReadyJob ? `\u{1F3AC} <b>Siguiente:</b> ${escapeHtml(nextReadyJob.title)}${isPreDownloaded ? " \xB7 \u2705 <i>Ya pre-descargado en disco</i>" : ""}` : void 0,
+      `\u{1F6E1}\uFE0F <b>Intervalo configurado:</b> ${curTimerMins} min${quotaSettings.queueHumanJitterEnabled !== false ? " (\xB12 min humano)" : ""}`
+    ]) + `
+`;
+  }
   if (!activeBlock) {
     activeBlock = `\u{1F7E2} <b>Estado del motor:</b> <i>En reposo (listo para recibir videos).</i>
+\u23F1\uFE0F <b>Temporizador entre subidas en cola:</b> ${curTimerMins > 0 ? `<b>${curTimerMins} min</b>${quotaSettings.queueHumanJitterEnabled !== false ? " (\xB12m humano)" : ""}` : "<i>Desactivado (0 min)</i>"}
 
 `;
   }
@@ -10182,7 +10558,10 @@ async function sendOrEditQueueManagerInTelegram(chatId, messageId, replyToMessag
 ` : "";
   const queueBlock = normalQueuedJobs.length > 0 ? `${hudSection(`En cola de espera (${normalQueuedJobs.length})`)}
 ` + normalQueuedJobs.slice(0, 10).map(
-    (j, idx) => `<b>${idx + 1}.</b> \u{1F3AC} ${escapeHtml(j.title)} \xB7 <code>${formatBytes(j.expectedBytes)}</code>`
+    (j, idx) => {
+      const readyOnDisk = Boolean(j.integrityVerified && j.tempFilePath && fs3.existsSync(j.tempFilePath));
+      return `<b>${idx + 1}.</b> \u{1F3AC} ${escapeHtml(j.title)} \xB7 <code>${formatBytes(j.expectedBytes)}</code>${readyOnDisk ? " \xB7 \u2705 <i>En disco</i>" : ""}`;
+    }
   ).join("\n") + `
 
 ` : encoderWaitingJobs.length === 0 ? `\u{1F4ED} <b>Cola de espera:</b> <i>Vac\xEDa (0 videos pendientes).</i>
@@ -10201,6 +10580,14 @@ async function sendOrEditQueueManagerInTelegram(chatId, messageId, replyToMessag
 
 ${activeBlock}${encoderBlock}${queueBlock}${pinnedBlock}`;
   const keyboard = [];
+  if (timerHoldingNow) {
+    keyboard.push([
+      {
+        text: `\u26A1 Saltar Temporizador y Subir Ahora (${formatRemainingQueueTimerLabel()})`,
+        callback_data: "queue_timer:skip"
+      }
+    ]);
+  }
   if (activeUploadJob) {
     keyboard.push([
       {
@@ -10237,6 +10624,12 @@ ${activeBlock}${encoderBlock}${queueBlock}${pinnedBlock}`;
       }
     ]);
   }
+  keyboard.push([
+    {
+      text: `\u23F1\uFE0F Temporizador Cola: ${curTimerMins > 0 ? `${curTimerMins} min` : "OFF"}`,
+      callback_data: "queue_timer:menu"
+    }
+  ]);
   if (pinned) {
     keyboard.push([
       {
@@ -19193,6 +19586,75 @@ Esta acci\xF3n eliminar\xE1 o retirar\xE1 el cap\xEDtulo/video de tu canal en Pi
       await sendOrEditQueueManagerInTelegram(chatId2, messageId);
       return;
     }
+    if (data === "queue_timer:menu") {
+      await callTelegramBotApi("answerCallbackQuery", {
+        callback_query_id: cq.id,
+        text: "Configurando temporizador de cola..."
+      }).catch(() => {
+      });
+      await sendOrEditQueueTimerMenuInTelegram(chatId2, messageId);
+      return;
+    }
+    if (data === "queue_timer:skip") {
+      skipQueueUploadTimerNow();
+      await callTelegramBotApi("answerCallbackQuery", {
+        callback_query_id: cq.id,
+        text: "\u26A1 Temporizador saltado. Iniciando siguiente subida ahora..."
+      }).catch(() => {
+      });
+      await sendOrEditQueueManagerInTelegram(
+        chatId2,
+        messageId,
+        void 0,
+        `\u26A1 <b>Temporizador saltado manualmente.</b> Iniciando la subida del siguiente video en cola ahora mismo.`
+      );
+      return;
+    }
+    if (data === "queue_timer:jitter") {
+      quotaSettings.queueHumanJitterEnabled = quotaSettings.queueHumanJitterEnabled === false;
+      saveQuotaSettingsToDisk();
+      await callTelegramBotApi("answerCallbackQuery", {
+        callback_query_id: cq.id,
+        text: quotaSettings.queueHumanJitterEnabled ? "\u{1F3B2} Variaci\xF3n humana (\xB12 min) ACTIVADA" : "\u26AA Variaci\xF3n humana DESACTIVADA"
+      }).catch(() => {
+      });
+      await sendOrEditQueueTimerMenuInTelegram(
+        chatId2,
+        messageId,
+        void 0,
+        quotaSettings.queueHumanJitterEnabled ? `\u2705 <b>Variaci\xF3n Humana (\xB12 min) activada:</b> Los tiempos entre subidas tendr\xE1n una ligera variaci\xF3n natural.` : `\u2139\uFE0F <b>Variaci\xF3n Humana desactivada:</b> El temporizador usar\xE1 exactamente los minutos seleccionados.`
+      );
+      return;
+    }
+    if (data.startsWith("queue_timer:set:")) {
+      const minsRaw = Number(data.slice("queue_timer:set:".length));
+      const nextMins = Number.isFinite(minsRaw) && minsRaw >= 0 && minsRaw <= 180 ? Math.round(minsRaw) : DEFAULT_QUEUE_SPACING_MINUTES;
+      quotaSettings.queueSpacingMinutes = nextMins;
+      if (nextMins <= 0) {
+        skipQueueUploadTimerNow();
+      } else if (isQueueTimerHoldingUpload()) {
+        const cappedTarget = Date.now() + computeEffectiveQueueSpacingMs(nextMins, quotaSettings.queueHumanJitterEnabled !== false);
+        if (quotaSettings.nextUploadAllowedAtMs > cappedTarget) {
+          quotaSettings.nextUploadAllowedAtMs = cappedTarget;
+        }
+        saveQuotaSettingsToDisk();
+        scheduleNextQueueSpacingWakeup();
+      } else {
+        saveQuotaSettingsToDisk();
+      }
+      await callTelegramBotApi("answerCallbackQuery", {
+        callback_query_id: cq.id,
+        text: nextMins > 0 ? `\u23F1\uFE0F Temporizador fijado en ${nextMins} min` : "\u26A1 Temporizador desactivado (subida continua)"
+      }).catch(() => {
+      });
+      await sendOrEditQueueTimerMenuInTelegram(
+        chatId2,
+        messageId,
+        void 0,
+        nextMins > 0 ? `\u2705 <b>Temporizador Anti-Sospecha actualizado a ${nextMins} minutos</b> entre cada subida de la cola.` : `\u26A1 <b>Temporizador desactivado (0 min):</b> Los videos en cola se subir\xE1n uno tras otro sin pausa.`
+      );
+      return;
+    }
     if (data === "quota_menu") {
       pendingPoolAccountByChat.delete(chatId2);
       await callTelegramBotApi("answerCallbackQuery", {
@@ -21650,6 +22112,37 @@ Escribe ahora el <b>enlace directo de tu canal</b> (ej: <code>https://www.picta.
     await sendOrEditQueueManagerInTelegram(chatId, null, msg.message_id);
     return;
   }
+  if (text.startsWith("/temporizador") || text.startsWith("/espera")) {
+    const argMin = text.replace(/^\/(temporizador|espera)(@\w+)?/i, "").trim();
+    if (argMin && /^\d+$/.test(argMin)) {
+      const parsedMin = Math.max(0, Math.min(180, Number(argMin)));
+      quotaSettings.queueSpacingMinutes = parsedMin;
+      if (parsedMin <= 0) {
+        skipQueueUploadTimerNow();
+      } else {
+        saveQuotaSettingsToDisk();
+      }
+      await sendOrEditQueueTimerMenuInTelegram(
+        chatId,
+        null,
+        msg.message_id,
+        parsedMin > 0 ? `\u2705 <b>Temporizador de cola configurado en ${parsedMin} minutos.</b>` : `\u26A1 <b>Temporizador de cola desactivado (0 min).</b>`
+      );
+      return;
+    }
+    await sendOrEditQueueTimerMenuInTelegram(chatId, null, msg.message_id);
+    return;
+  }
+  if (text.startsWith("/saltar")) {
+    skipQueueUploadTimerNow();
+    await sendOrEditQueueManagerInTelegram(
+      chatId,
+      null,
+      msg.message_id,
+      `\u26A1 <b>Temporizador saltado manualmente.</b> Si hay un video listo en cola, comenzar\xE1 a subirse ahora mismo.`
+    );
+    return;
+  }
   if (text.startsWith("/unir") || text.startsWith("/partes") || text.startsWith("/join")) {
     await sendOrEditMultiPartMenuInTelegram(chatId, null, msg.message_id);
     return;
@@ -23677,6 +24170,35 @@ async function startServer() {
     }, 20 * 1e3);
     if (typeof encoderRetryInterval.unref === "function") {
       encoderRetryInterval.unref();
+    }
+    const midnightCubaResetInterval = setInterval(() => {
+      try {
+        if (externalCloudRunWebhookActive) return;
+        const didReset = ensureDailyQuotaReset();
+        if (didReset) {
+          let unlockedCount = 0;
+          for (const qId of uploadQueue) {
+            const j = transferJobs.find((x) => x.id === qId);
+            if (j && j.stage === "queued" && j.errorDetails && (j.errorDetails.includes("QUOTA_") || isDailyLimitErrorText(j.errorDetails))) {
+              j.errorDetails = void 0;
+              unlockedCount++;
+            }
+          }
+          if (unlockedCount > 0) {
+            saveJobsToDisk();
+            addLiveLog(
+              "picta",
+              "info",
+              `Reinicio autom\xE1tico de cuota 00:01 AM (Hora de Cuba): Reanudando ${unlockedCount} video(s) en cola nocturna.`
+            );
+            void scheduleTransferPipeline();
+          }
+        }
+      } catch {
+      }
+    }, 30 * 1e3);
+    if (typeof midnightCubaResetInterval.unref === "function") {
+      midnightCubaResetInterval.unref();
     }
     const alertsBaselineTimer = setTimeout(() => {
       if (!externalCloudRunWebhookActive) {
