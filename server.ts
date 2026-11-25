@@ -584,7 +584,7 @@ function getMemoryTelemetry() {
 var MAX_PREFETCH_LOOKAHEAD = 1;
 function isJobReadyForUpload(job) {
   if (!job) return false;
-  if (job.stage === "quota_paused" || job.stage === "encoder_paused") return false;
+  if (job.stage === "quota_paused" || job.stage === "encoder_paused" || job.stage === "s3_paused") return false;
   if (job.stage !== "queued") return false;
   if (job.minioKey) return true;
   return Boolean(job.integrityVerified && job.fileExistsOnDisk);
@@ -605,7 +605,7 @@ function selectNextDownloadJob(queue, jobsMap, activeDownloadJobId2, _activeUplo
   for (const id of queue) {
     const job = jobsMap.get(id);
     if (!job) continue;
-    if (job.stage === "quota_paused" || job.stage === "encoder_paused") continue;
+    if (job.stage === "quota_paused" || job.stage === "encoder_paused" || job.stage === "s3_paused") continue;
     if (isJobReadyForUpload(job)) {
       prefetchedCount++;
       continue;
@@ -1369,6 +1369,73 @@ function isEncoderJobDueForRetry(job) {
   if (!job || job.stage !== "queued") return false;
   if (!job.encoderRetryActive) return false;
   const nextAt = Number(job.encoderRetryNextAt || 0);
+  return nextAt > 0 && Date.now() >= nextAt;
+}
+var MAX_S3_AUTO_RETRIES = 5;
+var S3_RETRY_DELAYS_MIN = [5, 10, 15, 25, 35];
+function isTransientS3UploadError(errorMsg) {
+  const raw = String(errorMsg || "").trim();
+  if (!raw) return false;
+  const lower = raw.toLowerCase();
+  if (
+    lower.includes("subida_cancelada_por_usuario") ||
+    lower.includes("cancelado por el usuario") ||
+    lower.includes("enospc") ||
+    lower.includes("enospace") ||
+    lower.includes("quota_") ||
+    lower.includes("archivo local no encontrado") ||
+    lower.includes("verificación de integridad") ||
+    lower.includes("verificacion de integridad") ||
+    lower.includes("http 401") ||
+    lower.includes("http 403") ||
+    lower.includes("http 404") ||
+    lower.includes("http 400")
+  ) {
+    return false;
+  }
+  return /error s3 minio http 50[0234]|requesttimeout|slowdown|serviceunavailable|internalerror|timeout\s+(tcp|tls)|timeout\s+de\s+socket|timeout\s+esperando|conexi[oó]n s3 estancada|error de red en s3 picta|videos\.picta\.cu|econnreset|etimedout|econnrefused|epipe|eai_again|socket hang up|fetch failed|502 bad gateway|503 service unavailable|504 gateway/i.test(raw);
+}
+function extractShortS3ErrorReason(errorMsg) {
+  const raw = String(errorMsg || "").trim();
+  const lower = raw.toLowerCase();
+  if (lower.includes("timeout tcp") || lower.includes("timeout tls")) {
+    return "El servidor S3 de Picta (videos.picta.cu) no respondió a la conexión TCP/TLS (posible bloqueo o saturación temporal)";
+  }
+  if (lower.includes("requesttimeout") || lower.includes("503") || lower.includes("slowdown")) {
+    return "S3 MinIO de Picta devolvió HTTP 503 / RequestTimeout temporal";
+  }
+  if (lower.includes("estancada") || lower.includes("socket") || lower.includes("confirmación") || lower.includes("confirmacion")) {
+    return "La transferencia hacia videos.picta.cu se detuvo o agotó el tiempo de espera";
+  }
+  return "Fallo temporal de red conectando con el almacenamiento S3 de Picta";
+}
+function computeNextS3RetryState(currentRetryCount, nowMs = Date.now()) {
+  const count = Math.max(0, Number(currentRetryCount || 0));
+  if (count >= MAX_S3_AUTO_RETRIES) {
+    return {
+      shouldContinue: false,
+      nextAttemptCount: count,
+      waitMinutes: 0,
+      nextRetryAtMs: 0
+    };
+  }
+  const waitMinutes = S3_RETRY_DELAYS_MIN[Math.min(count, S3_RETRY_DELAYS_MIN.length - 1)] || 15;
+  return {
+    shouldContinue: true,
+    nextAttemptCount: count + 1,
+    waitMinutes,
+    nextRetryAtMs: nowMs + waitMinutes * 60 * 1e3
+  };
+}
+function isS3JobPausedInQueue(job) {
+  if (!job || job.stage !== "queued") return false;
+  if (!job.s3RetryActive) return false;
+  return Number(job.s3RetryNextAt || 0) > Date.now();
+}
+function isS3JobDueForRetry(job) {
+  if (!job || job.stage !== "queued") return false;
+  if (!job.s3RetryActive) return false;
+  const nextAt = Number(job.s3RetryNextAt || 0);
   return nextAt > 0 && Date.now() >= nextAt;
 }
 
@@ -5613,6 +5680,7 @@ function buildErrorSignature(source, message) {
     .toLowerCase()
     .replace(/https?:\/\/\S+/g, "<url>")
     .replace(/\(\s*\d+\s*\/\s*\d+\s*\)/g, "(N/N)")
+    .replace(/\ben \d+s\b/gi, "en Ns")
     .replace(/[0-9a-f]{16,}/g, "<hex>")
     .replace(/#\d+/g, "#N")
     .replace(/\b\d{2,}\b/g, "N")
@@ -10926,7 +10994,7 @@ function getProtectedScratchPaths(excludeJobId) {
   const nowMs = Date.now();
   for (const j of transferJobs) {
     if (!j || !j.tempFilePath || j.id === excludeJobId) continue;
-    const isActivelyProtected = protectedIds.has(j.id);
+    const isActivelyProtected = protectedIds.has(j.id) || (j.stage === "queued" && Boolean(j.s3RetryActive));
     const isStagedQueued = j.stage === "queued" && !j.minioKey && Boolean(j.integrityVerified) && (j.expectedBytes === 0 || j.diskVerifiedBytes === j.expectedBytes) && (!j.errorDetails || !j.errorDetails.includes("QUOTA_") && !isDailyLimitErrorText(j.errorDetails));
     const isRecentQueuedPart = (j.stage === "queued" || j.stage === "downloading_mtproto") && fs3.existsSync(`${j.tempFilePath}.part.json`) && nowMs - new Date(j.updatedAt || j.createdAt || 0).getTime() < 2 * 60 * 60 * 1e3;
     if (isActivelyProtected) {
@@ -11164,10 +11232,11 @@ function buildPipelineJobsMap() {
       j.errorDetails && (j.errorDetails.includes("QUOTA_") || isDailyLimitErrorText(j.errorDetails))
     );
     const isEncoderPaused = isEncoderJobPausedInQueue(j);
+    const isS3Paused = isS3JobPausedInQueue(j);
     map.set(j.id, {
       id: j.id,
       telegramChatId: j.telegramChatId,
-      stage: isQuotaPaused ? "quota_paused" : isEncoderPaused ? "encoder_paused" : j.stage,
+      stage: isQuotaPaused ? "quota_paused" : isEncoderPaused ? "encoder_paused" : isS3Paused ? "s3_paused" : j.stage,
       expectedBytes: j.expectedBytes,
       diskVerifiedBytes: j.diskVerifiedBytes,
       integrityVerified: j.integrityVerified,
@@ -11545,6 +11614,63 @@ ${safeErrBlock}
     }
     return;
   }
+  const hasLocalVerifiedFile = Boolean(job.tempFilePath && fs3.existsSync(job.tempFilePath));
+  const isTransientS3Err = !job.minioKey && isTransientS3UploadError(errMsg) && hasLocalVerifiedFile;
+  let exhaustedS3AutoRetries = false;
+  if (isTransientS3Err) {
+    const s3Decision = computeNextS3RetryState(job.s3RetryCount || 0, Date.now());
+    if (s3Decision.shouldContinue) {
+      job.stage = "queued";
+      job.s3RetryActive = true;
+      job.s3RetryCount = s3Decision.nextAttemptCount;
+      job.s3RetryNextAt = s3Decision.nextRetryAtMs;
+      job.s3RetryLastError = errMsg;
+      job.errorDetails = errMsg;
+      job.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
+      if (!uploadQueue.includes(job.id)) {
+        uploadQueue.push(job.id);
+      }
+      currentActivity = `S3 Picta ocupado para "${job.title}". Auto-reintento ${s3Decision.nextAttemptCount}/${MAX_S3_AUTO_RETRIES} en ${s3Decision.waitMinutes} min...`;
+      saveJobsToDisk();
+      startCloudRunCpuKeepAlive();
+      addLiveLog(
+        "picta",
+        "warn",
+        `Subida S3 diferida automáticamente (${s3Decision.nextAttemptCount}/${MAX_S3_AUTO_RETRIES}) en ${s3Decision.waitMinutes} min para "${job.title}" (${extractShortS3ErrorReason(errMsg)}).`
+      );
+      if (statusMsgId) {
+        const hasChatPool = getPoolAccountsForChat(job.telegramChatId).length > 0;
+        const s3DeferredKb = [
+          [{ text: "\u{1F504} Reintentar Ahora", callback_data: `retry:${job.id}` }],
+          [{ text: "\u{1F6D1} Detener Auto-Reintento S3", callback_data: `s3_stop_retry:${job.id}` }]
+        ];
+        if (hasChatPool) {
+          s3DeferredKb.push([
+            { text: "\u{1F91D} Cambiar Cuenta y Reintentar", callback_data: `retry_acct:${job.id}` }
+          ]);
+        }
+        await editTelegramStatusMessage(
+          job.telegramChatId,
+          statusMsgId,
+          `${hudHeader("S3 PICTA OCUPADO \xB7 AUTO-REINTENTO DIFERIDO")}
+` + hudBox([
+            `\u{1F3AC} <b>T\xEDtulo:</b> ${escapeHtml(job.title)}`,
+            `\u{1F4C2} <b>Categor\xEDa:</b> ${escapeHtml(job.category || "Audiovisual")}`,
+            `\u{1F4BE} <b>Archivo local:</b> \u2705 \xCDntegro en disco (0 MB por re-descargar)`,
+            `\u23F1\uFE0F <b>Pr\xF3ximo intento:</b> en <b>${s3Decision.waitMinutes} min</b> (${s3Decision.nextAttemptCount}/${MAX_S3_AUTO_RETRIES}) \xB7 <b>${formatCubaTimeAtMs(s3Decision.nextRetryAtMs)}</b> hora Cuba`
+          ]) + `
+\u{1F4A1} <b>Motivo:</b> ${escapeHtml(extractShortS3ErrorReason(errMsg))}
+<i>El archivo queda protegido en cola y el bot reintentar\xE1 autom\xE1ticamente tras enfriar la conexi\xF3n con Picta.</i>`,
+          s3DeferredKb,
+          true
+        );
+      }
+      return;
+    }
+    exhaustedS3AutoRetries = Boolean(
+      job.s3RetryActive && (job.s3RetryCount || 0) >= MAX_S3_AUTO_RETRIES
+    );
+  }
   const isForbiddenErr = isPictaForbiddenResponse(job.pictaResponseCode, errMsg);
   let roleDiagnosticNote = "";
   if (isForbiddenErr) {
@@ -11576,6 +11702,11 @@ ${safeErrBlock}
   job.encoderRetryActive = false;
   job.encoderRetryNextAt = void 0;
   job.encoderManualRetryTriggered = false;
+  job.s3RetryActive = false;
+  job.s3RetryNextAt = void 0;
+  if (isTransientS3Err) {
+    job.s3RetryLastError = errMsg;
+  }
   job.errorDetails = errMsg;
   job.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
   currentActivity = `Error en "${job.fileName}": ${errMsg.slice(0, 90)}`;
@@ -11593,6 +11724,12 @@ ${safeErrBlock}
           callback_data: `retry:${job.id}`
         }
       ],
+      ...(isTransientS3Err ? [[
+        {
+          text: exhaustedS3AutoRetries ? "\u23F1\uFE0F Reactivar Auto-Reintento S3 (en 5 min)" : "\u23F1\uFE0F Auto-Reintentar S3 en Cola (en 5 min)",
+          callback_data: `s3_auto_queue:${job.id}`
+        }
+      ]] : []),
       [
         {
           text: "\u270D\uFE0F Rellenar / Corregir Datos en Telegram",
@@ -11611,7 +11748,7 @@ ${safeErrBlock}
     await editTelegramStatusMessage(
       job.telegramChatId,
       statusMsgId,
-      `${hudHeader("PUBLICACI\xD3N INTERRUMPIDA")}
+      `${hudHeader(exhaustedS3AutoRetries ? `S3 PICTA INACCESIBLE (${MAX_S3_AUTO_RETRIES} RONDAS DIFERIDAS)` : "PUBLICACI\xD3N INTERRUMPIDA")}
 ` + hudBox([
         `\u{1F3AC} <b>T\xEDtulo:</b> ${escapeHtml(job.title)}`,
         `\u{1F4C2} <b>Categor\xEDa:</b> ${escapeHtml(job.category || "Audiovisual")}`,
@@ -11622,10 +11759,12 @@ ${safeErrBlock}
 
 ` : isEncoderServerErr ? `\u{1F4A1} <b>Nota:</b> ${escapeHtml(extractShortEncoderErrorReason(errMsg))}
 
+` : isTransientS3Err ? `\u{1F4A1} <b>Nota:</b> ${escapeHtml(extractShortS3ErrorReason(errMsg))}
+
 ` : "") + `${hudSection("Detalle del error")}
 ${safeErrBlock}
 
-` + (roleDiagnosticNote ? `\u{1F4A1} <i>Tu video qued\xF3 guardado en S3 MinIO. Apenas soporte reactive el rol <b>Jefe de canal</b>, pulsa Reintentar.</i>` : job.minioKey ? `\u{1F4A1} <i>El video ya est\xE1 subido al 100% en S3 MinIO. Usa "Reintentar" o "Rellenar / Corregir Datos".</i>` : `\u{1F4A1} <i>La subida a S3 MinIO no se complet\xF3. Pulsa "Reintentar" para volver a subir el archivo correctamente.</i>`),
+` + (roleDiagnosticNote ? `\u{1F4A1} <i>Tu video qued\xF3 guardado en S3 MinIO. Apenas soporte reactive el rol <b>Jefe de canal</b>, pulsa Reintentar.</i>` : job.minioKey ? `\u{1F4A1} <i>El video ya est\xE1 subido al 100% en S3 MinIO. Usa "Reintentar" o "Rellenar / Corregir Datos".</i>` : isTransientS3Err ? `\u{1F4A1} <i>El archivo sigue intacto en disco. Pulsa "Reintentar" ahora o reactiva el auto-reintento diferido.</i>` : `\u{1F4A1} <i>La subida a S3 MinIO no se complet\xF3. Pulsa "Reintentar" para volver a subir el archivo correctamente.</i>`),
       retryKeyboard,
       true
     );
@@ -11721,7 +11860,7 @@ ${stage2Note}`,
     stopCloudRunCpuKeepAlive();
     if (downloadStageFailed) {
       scheduleErrorBatchFlush(800, job.title || job.fileName, true);
-    } else if (!activeUploadJobId && isQueueTimerHoldingUpload() && !job.encoderRetryActive) {
+    } else if (!activeUploadJobId && isQueueTimerHoldingUpload() && !job.encoderRetryActive && !job.s3RetryActive) {
       scheduleErrorBatchFlush(1200, job.title || job.fileName, true);
     } else {
       scheduleErrorBatchFlush(1500, job.title || job.fileName, false);
@@ -11770,6 +11909,21 @@ async function runUploadStage(job) {
     } else if (!localFilePath || !fs3.existsSync(localFilePath) || job.expectedBytes > 0 && fs3.statSync(localFilePath).size !== job.expectedBytes) {
       localFilePath = await downloadFullVideoFromTelegram(job, statusMsgId);
       verifyCompleteFileOnDisk(job, localFilePath);
+    } else if (job.s3RetryActive && statusMsgId) {
+      const s3AttemptNum = Math.max(1, job.s3RetryCount || 1);
+      await editTelegramStatusMessage(
+        job.telegramChatId,
+        statusMsgId,
+        `${hudHeader(`RETOMANDO SUBIDA S3 · RONDA #${s3AttemptNum}/${MAX_S3_AUTO_RETRIES}`)}
+` + hudBox([
+          `\u{1F3AC} <b>T\xEDtulo:</b> ${escapeHtml(job.title)}`,
+          `\u{1F4C2} <b>Categor\xEDa:</b> ${escapeHtml(job.category || "Audiovisual")}`,
+          `\u{1F4E6} <b>Tama\xF1o en disco:</b> ${formatBytes(job.diskVerifiedBytes || job.expectedBytes)}`
+        ]) + `
+\u{1F504} <i>Reconectando con S3 Picta (${chLabel})...</i>`,
+        void 0,
+        true
+      );
     }
     await uploadFullVerifiedFileToPicta(job, localFilePath, statusMsgId);
     removeJobFromUploadQueue(job.id);
@@ -11780,6 +11934,10 @@ async function runUploadStage(job) {
     job.encoderRetryNextAt = void 0;
     job.encoderRetryLastError = void 0;
     job.encoderManualRetryTriggered = false;
+    job.s3RetryActive = false;
+    job.s3RetryCount = void 0;
+    job.s3RetryNextAt = void 0;
+    job.s3RetryLastError = void 0;
     job.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
     currentActivity = `\xDAltima subida completada en ${channelName} (#${channelId}): "${job.title}" (${formatBytes(job.diskVerifiedBytes || job.expectedBytes)})`;
     saveJobsToDisk();
@@ -11902,7 +12060,7 @@ async function scheduleTransferPipeline() {
       if (nextUpload) {
         const jobObj = transferJobs.find((j) => j.id === nextUpload.id);
         if (jobObj && !runningJobIds.has(jobObj.id)) {
-          if (isQueueTimerHoldingUpload() && !jobObj.encoderRetryActive) {
+          if (isQueueTimerHoldingUpload() && !jobObj.encoderRetryActive && !jobObj.s3RetryActive) {
             scheduleNextQueueSpacingWakeup();
           } else {
             void runUploadStage(jobObj);
@@ -11970,6 +12128,8 @@ async function cancelTransferJob(jobId, chatId, messageId) {
   job.encoderRetryActive = false;
   job.encoderRetryNextAt = void 0;
   job.encoderManualRetryTriggered = false;
+  job.s3RetryActive = false;
+  job.s3RetryNextAt = void 0;
   job.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
   saveJobsToDisk();
   if (job.tempFilePath) {
@@ -12071,7 +12231,8 @@ async function sendOrEditQueueManagerInTelegram(chatId, messageId, replyToMessag
   const activeDownloadJob = activeDownloadJobId && activeDownloadJobId !== activeUploadJobId ? transferJobs.find((j) => Boolean(j) && j.id === activeDownloadJobId && (isMaster || j.telegramChatId === chatId)) : null;
   const queuedJobs = uploadQueue.filter((id) => id !== activeUploadJobId && id !== activeDownloadJobId).map((id) => transferJobs.find((j) => Boolean(j) && j.id === id)).filter((j) => Boolean(j)).filter((j) => isMaster || j.telegramChatId === chatId);
   const encoderWaitingJobs = queuedJobs.filter((j) => Boolean(j.encoderRetryActive));
-  const normalQueuedJobs = queuedJobs.filter((j) => !j.encoderRetryActive);
+  const s3WaitingJobs = queuedJobs.filter((j) => !j.encoderRetryActive && Boolean(j.s3RetryActive));
+  const normalQueuedJobs = queuedJobs.filter((j) => !j.encoderRetryActive && !j.s3RetryActive);
   const pinned = pinnedBatchSerieByChat.get(chatId);
   const channelTag = isMaster ? "MULTIVERSO VISUAL (#36319)" : escapeHtml((session?.channelName || "MI CANAL").toUpperCase());
   const curTimerMins = Number(quotaSettings.queueSpacingMinutes ?? DEFAULT_QUEUE_SPACING_MINUTES);
@@ -12131,6 +12292,16 @@ ${diskInfoNote}`;
   }).join("\n") + `
 
 ` : "";
+  const s3WaitingBlock = s3WaitingJobs.length > 0 ? `${hudSection(`Esperando S3 Picta (${s3WaitingJobs.length})`)}
+` + s3WaitingJobs.slice(0, 6).map((j, idx) => {
+    const remMin = Math.max(
+      0,
+      Math.ceil((Number(j.s3RetryNextAt || 0) - Date.now()) / 6e4)
+    );
+    return `<b>${idx + 1}.</b> \u23F3 ${escapeHtml(j.title)} \xB7 <code>${j.s3RetryCount || 1}/${MAX_S3_AUTO_RETRIES}</code>${remMin > 0 ? ` (~${remMin}m)` : " (pronto)"}`;
+  }).join("\n") + `
+
+` : "";
   const queueBlock = normalQueuedJobs.length > 0 ? `${hudSection(`En cola de espera (${normalQueuedJobs.length})`)}
 ` + normalQueuedJobs.slice(0, 10).map(
     (j, idx) => {
@@ -12139,7 +12310,7 @@ ${diskInfoNote}`;
     }
   ).join("\n") + `
 
-` : encoderWaitingJobs.length === 0 ? `\u{1F4ED} <b>Cola de espera:</b> <i>Vac\xEDa (0 videos pendientes).</i>
+` : encoderWaitingJobs.length === 0 && s3WaitingJobs.length === 0 ? `\u{1F4ED} <b>Cola de espera:</b> <i>Vac\xEDa (0 videos pendientes).</i>
 
 ` : "";
   const pinnedBlock = pinned ? `${hudSection("Modo Serie Fija (R\xE1faga)")} \xB7 \u{1F7E2} <b>ACTIVO</b>
@@ -12153,7 +12324,7 @@ ${diskInfoNote}`;
 
 ` : "") + `${hudHeader(`COLA Y MODO R\xC1FAGA \xB7 ${channelTag}`)}
 
-${activeBlock}${encoderBlock}${queueBlock}${pinnedBlock}`;
+${activeBlock}${encoderBlock}${s3WaitingBlock}${queueBlock}${pinnedBlock}`;
   const keyboard = [];
   if (timerHoldingNow) {
     keyboard.push([
@@ -12188,6 +12359,18 @@ ${activeBlock}${encoderBlock}${queueBlock}${pinnedBlock}`;
       {
         text: `\u{1F6D1} Parar`,
         callback_data: `encoder_stop_retry:${eJob.id}`
+      }
+    ]);
+  }
+  for (const sJob of s3WaitingJobs.slice(0, 4)) {
+    keyboard.push([
+      {
+        text: `\u{1F504} Reintentar Ya: "${sJob.title.slice(0, 16)}"`,
+        callback_data: `retry:${sJob.id}`
+      },
+      {
+        text: `\u{1F6D1} Parar S3`,
+        callback_data: `s3_stop_retry:${sJob.id}`
       }
     ]);
   }
@@ -12907,6 +13090,7 @@ async function triggerCloudRunKeepAliveTransfer(jobId, customTitle, callbackMess
   job.stage = "queued";
   job.errorDetails = void 0;
   job.encoderRetryNextAt = void 0;
+  job.s3RetryNextAt = void 0;
   if (!uploadQueue.includes(job.id)) {
     uploadQueue.push(job.id);
   }
@@ -22191,8 +22375,12 @@ Esta acci\xF3n eliminar\xE1 o retirar\xE1 el cap\xEDtulo/video de tu canal en Pi
       if (wasEncoderFailure) {
         job.encoderManualRetryTriggered = true;
       }
+      if (!job.s3RetryActive || (job.s3RetryCount || 0) >= MAX_S3_AUTO_RETRIES) {
+        job.s3RetryCount = 0;
+      }
       clearUnconfirmedGhostMinioKey(job);
       job.encoderRetryNextAt = 0;
+      job.s3RetryNextAt = 0;
       job.stage = job.minioKey ? "creating_picta_publication" : "generating_auto_title";
       job.errorDetails = void 0;
       job.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
@@ -22215,6 +22403,93 @@ Esta acci\xF3n eliminar\xE1 o retirar\xE1 el cap\xEDtulo/video de tu canal en Pi
         )
       ]);
       await triggerCloudRunKeepAliveTransfer(job.id, job.title, messageId);
+      return;
+    }
+    if (data.startsWith("s3_auto_queue:")) {
+      const jobId = data.slice("s3_auto_queue:".length);
+      const job = transferJobs.find((j) => j.id === jobId);
+      if (!job || !isMasterAdminChat(chatId2) && job.telegramChatId !== chatId2) return;
+      if (messageId) {
+        job.statusMessageId = messageId;
+      }
+      const hasFile = Boolean(job.tempFilePath && fs3.existsSync(job.tempFilePath));
+      if (!hasFile) {
+        await callTelegramBotApi("answerCallbackQuery", {
+          callback_query_id: cq.id,
+          text: "Reanudando subida normal..."
+        }).catch(() => {
+        });
+        await triggerCloudRunKeepAliveTransfer(job.id, job.title, messageId);
+        return;
+      }
+      const prevCount = Number(job.s3RetryCount || 0) >= MAX_S3_AUTO_RETRIES ? 0 : Number(job.s3RetryCount || 0);
+      const decision = computeNextS3RetryState(prevCount, Date.now());
+      job.stage = "queued";
+      job.s3RetryActive = true;
+      job.s3RetryCount = decision.nextAttemptCount;
+      job.s3RetryNextAt = decision.nextRetryAtMs;
+      job.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
+      if (!uploadQueue.includes(job.id)) {
+        uploadQueue.push(job.id);
+      }
+      saveJobsToDisk();
+      startCloudRunCpuKeepAlive();
+      await Promise.all([
+        callTelegramBotApi("answerCallbackQuery", {
+          callback_query_id: cq.id,
+          text: `\u23F1\uFE0F Auto-reintento S3 activado (en ${decision.waitMinutes} min)`
+        }).catch(() => {
+        }),
+        editTelegramStatusMessage(
+          chatId2,
+          messageId,
+          `${hudHeader("S3 PICTA OCUPADO \xB7 AUTO-REINTENTO DIFERIDO")}
+` + hudBox([
+            `\u{1F3AC} <b>T\xEDtulo:</b> ${escapeHtml(job.title)}`,
+            `\u{1F4C2} <b>Categor\xEDa:</b> ${escapeHtml(job.category || "Audiovisual")}`,
+            `\u{1F4BE} <b>Archivo local:</b> \u2705 \xCDntegro en disco (0 MB por re-descargar)`,
+            `\u23F1\uFE0F <b>Pr\xF3ximo intento:</b> en <b>${decision.waitMinutes} min</b> (${decision.nextAttemptCount}/${MAX_S3_AUTO_RETRIES}) \xB7 <b>${formatCubaTimeAtMs(decision.nextRetryAtMs)}</b> hora Cuba`
+          ]) + `
+<i>Tus dem\xE1s subidas contin\xFAan con normalidad. Te avisar\xE9 al completarse la subida S3.</i>`,
+          [
+            [{ text: "\u{1F504} Reintentar Ahora Mismo", callback_data: `retry:${job.id}` }],
+            [{ text: "\u{1F6D1} Detener Auto-Reintento S3", callback_data: `s3_stop_retry:${job.id}` }]
+          ],
+          true
+        )
+      ]);
+      return;
+    }
+    if (data.startsWith("s3_stop_retry:")) {
+      const jobId = data.slice("s3_stop_retry:".length);
+      const job = transferJobs.find((j) => j.id === jobId);
+      if (!job || !isMasterAdminChat(chatId2) && job.telegramChatId !== chatId2) return;
+      removeJobFromUploadQueue(job.id);
+      job.stage = "failed";
+      job.s3RetryActive = false;
+      job.s3RetryNextAt = void 0;
+      job.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
+      saveJobsToDisk();
+      await Promise.all([
+        callTelegramBotApi("answerCallbackQuery", {
+          callback_query_id: cq.id,
+          text: "\u23F8\uFE0F Auto-reintento S3 detenido."
+        }).catch(() => {
+        }),
+        editTelegramStatusMessage(
+          chatId2,
+          messageId,
+          `\u23F8\uFE0F <b>AUTO-REINTENTO S3 DETENIDO</b>
+<blockquote>\u{1F3AC} <b>T\xEDtulo:</b> ${escapeHtml(job.title)}
+\u{1F4BE} <b>Archivo local:</b> <code>${escapeHtml(job.fileName)}</code></blockquote>
+<i>Puedes reintentar la subida a S3 cuando quieras.</i>`,
+          [
+            [{ text: "\u{1F504} Reintentar Publicaci\xF3n Ahora", callback_data: `retry:${job.id}` }],
+            [{ text: "\u23F1\uFE0F Reactivar Auto-Reintento S3 (en 5 min)", callback_data: `s3_auto_queue:${job.id}` }]
+          ],
+          true
+        )
+      ]);
       return;
     }
     if (data.startsWith("encoder_auto_queue:")) {
@@ -24257,7 +24532,11 @@ Escribe ahora el t\xEDtulo que pidi\xF3 el suscriptor (o usa <code>/pedir Nombre
       )) {
         failedJob.encoderManualRetryTriggered = true;
       }
+      if (!failedJob.s3RetryActive || (failedJob.s3RetryCount || 0) >= MAX_S3_AUTO_RETRIES) {
+        failedJob.s3RetryCount = 0;
+      }
       failedJob.encoderRetryNextAt = 0;
+      failedJob.s3RetryNextAt = 0;
       failedJob.stage = failedJob.minioKey ? "creating_picta_publication" : "generating_auto_title";
       failedJob.errorDetails = void 0;
       failedJob.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
@@ -26035,15 +26314,15 @@ async function startServer() {
     const encoderRetryInterval = setInterval(() => {
       try {
         if (externalCloudRunWebhookActive || activeUploadJobId) return;
-        const hasDueEncoderRetry = uploadQueue.some((qId) => {
+        const hasDueRetry = uploadQueue.some((qId) => {
           const j = transferJobs.find((x) => x.id === qId);
-          return j && isEncoderJobDueForRetry(j);
+          return j && (isEncoderJobDueForRetry(j) || isS3JobDueForRetry(j));
         });
-        if (hasDueEncoderRetry) {
+        if (hasDueRetry) {
           void scheduleTransferPipeline();
         }
       } catch (err) {
-        addLiveLog("worker", "error", `Error en ciclo de reintento de codificador: ${err instanceof Error ? err.message : String(err)}`);
+        addLiveLog("worker", "error", `Error en ciclo de reintento diferido: ${err instanceof Error ? err.message : String(err)}`);
       }
     }, 20 * 1e3);
     if (typeof encoderRetryInterval.unref === "function") {
@@ -26115,11 +26394,14 @@ async function startServer() {
           if (j.stage !== "queued") {
             j.stage = "queued";
           }
-          if (j.errorDetails && !j.encoderRetryActive && !j.errorDetails.includes("QUOTA_") && !isDailyLimitErrorText(j.errorDetails)) {
+          if (j.errorDetails && !j.encoderRetryActive && !j.s3RetryActive && !j.errorDetails.includes("QUOTA_") && !isDailyLimitErrorText(j.errorDetails)) {
             j.errorDetails = void 0;
           }
           if (j.encoderRetryActive && Number(j.encoderRetryNextAt || 0) <= Date.now()) {
             j.encoderRetryNextAt = Date.now() + 5e3;
+          }
+          if (j.s3RetryActive && Number(j.s3RetryNextAt || 0) <= Date.now()) {
+            j.s3RetryNextAt = Date.now() + 5e3;
           }
           if (!uploadQueue.includes(j.id)) {
             uploadQueue.push(j.id);
