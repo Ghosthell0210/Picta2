@@ -5609,7 +5609,16 @@ function sanitizeAlertOutputText(raw) {
   return s.trim();
 }
 function buildErrorSignature(source, message) {
-  const normMsg = String(message || "").toLowerCase().replace(/https?:\/\/\S+/g, "<url>").replace(/[0-9a-f]{16,}/g, "<hex>").replace(/#\d+/g, "#N").replace(/\b\d{2,}\b/g, "N").replace(/\s+/g, " ").trim().slice(0, 140);
+  const normMsg = String(message || "")
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, "<url>")
+    .replace(/\(\s*\d+\s*\/\s*\d+\s*\)/g, "(N/N)")
+    .replace(/[0-9a-f]{16,}/g, "<hex>")
+    .replace(/#\d+/g, "#N")
+    .replace(/\b\d{2,}\b/g, "N")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 140);
   return `${String(source || "system").toLowerCase()}::${normMsg}`;
 }
 function shouldNotifyAdminForEvent(source, level, message) {
@@ -5636,6 +5645,60 @@ var errorAlertDedupMap = /* @__PURE__ */ new Map();
 var adminErrorAlertQueue = [];
 var adminErrorAlertPumpBusy = false;
 var errorSentinelNotifyingSelf = false;
+var pendingOperationErrorAlerts = [];
+var pendingErrorFlushTimer = null;
+function isBotOperationActive() {
+  if (activeDownloadJobId || activeUploadJobId || activeJobId || runningJobIds.size > 0) {
+    return true;
+  }
+  for (const s of pendingMultiPartByChat.values()) {
+    if (s && s.assembling) return true;
+  }
+  return false;
+}
+function formatCubaTimeShort(isoOrMs) {
+  try {
+    return new Date(isoOrMs).toLocaleTimeString("es-CU", {
+      timeZone: "America/Havana",
+      hour12: false
+    });
+  } catch {
+    return "--:--:--";
+  }
+}
+function flushPendingOperationErrorAlerts(contextTitle, forceEvenIfOtherActive = false) {
+  if (pendingErrorFlushTimer) {
+    clearTimeout(pendingErrorFlushTimer);
+    pendingErrorFlushTimer = null;
+  }
+  if (pendingOperationErrorAlerts.length === 0) return;
+  if (!forceEvenIfOtherActive && isBotOperationActive()) {
+    return;
+  }
+  const drained = pendingOperationErrorAlerts.splice(0, pendingOperationErrorAlerts.length);
+  if (drained.length === 0) return;
+  if (!errorSentinelSettings.enabled || errorSentinelSettings.mutedUntilMs > Date.now() || IS_PREVIEW_INSTANCE) {
+    return;
+  }
+  if (adminErrorAlertQueue.length < 15) {
+    adminErrorAlertQueue.push({
+      kind: "batch",
+      contextTitle: contextTitle ? String(contextTitle).trim() : undefined,
+      items: drained
+    });
+    void pumpAdminErrorAlerts();
+  }
+}
+function scheduleErrorBatchFlush(delayMs = 1500, contextTitle, forceEvenIfOtherActive = false) {
+  if (pendingOperationErrorAlerts.length === 0) return;
+  if (pendingErrorFlushTimer) {
+    clearTimeout(pendingErrorFlushTimer);
+  }
+  pendingErrorFlushTimer = setTimeout(() => {
+    pendingErrorFlushTimer = null;
+    flushPendingOperationErrorAlerts(contextTitle, forceEvenIfOtherActive);
+  }, Math.max(250, delayMs));
+}
 async function pumpAdminErrorAlerts() {
   if (adminErrorAlertPumpBusy || IS_PREVIEW_INSTANCE) return;
   adminErrorAlertPumpBusy = true;
@@ -5646,23 +5709,59 @@ async function pumpAdminErrorAlerts() {
       if (!botConfig?.telegramBotToken?.trim()) continue;
       errorSentinelNotifyingSelf = true;
       try {
-        const timeCuba = new Date(item.timestamp).toLocaleTimeString("es-CU", {
-          timeZone: "America/Havana",
-          hour12: false
-        });
-        const cleanMsg = sanitizeAlertOutputText(item.message).slice(0, 1400);
-        const levelBadge = item.level === "error" ? "\u{1F6A8} ERROR" : "\u26A0\uFE0F ANOMAL\xCDA";
-        const srcBadge = String(item.source || "system").toUpperCase();
-        const text = `${hudHeader("CENTINELA DE ERRORES · ALERTA EN VIVO")}
+        let text = "";
+        if (item.kind === "batch" && Array.isArray(item.items) && item.items.length > 0) {
+          const items = item.items;
+          const totalOccurrences = items.reduce((acc, it) => acc + Math.max(1, Number(it.count || 1)), 0);
+          const firstTs = items[0].firstTimestamp;
+          const lastTs = items[items.length - 1].lastTimestamp;
+          const timeStart = formatCubaTimeShort(firstTs);
+          const timeEnd = formatCubaTimeShort(lastTs);
+          const timeRange = timeStart === timeEnd ? timeStart : `${timeStart} \u2192 ${timeEnd}`;
+          const hasFatal = items.some((it) => it.level === "error");
+          const maxShown = 12;
+          const visibleItems = items.slice(0, maxShown);
+          const hiddenCount = Math.max(0, items.length - visibleItems.length);
+          const detailLines = visibleItems.map((ev) => {
+            const icon = ev.level === "error" ? "\u{1F6A8}" : "\u26A0\uFE0F";
+            const srcBadge = String(ev.source || "sys").toUpperCase();
+            const t1 = formatCubaTimeShort(ev.firstTimestamp);
+            const t2 = formatCubaTimeShort(ev.lastTimestamp);
+            const tLabel = ev.count > 1 && t1 !== t2 ? `${t1}\u2013${t2}` : t2;
+            const cntBadge = ev.count > 1 ? ` \xB7 ${ev.count}x` : "";
+            const msgMaxLen = items.length <= 3 ? 360 : 210;
+            const cleanSnippet = sanitizeAlertOutputText(ev.message).slice(0, msgMaxLen);
+            return `${icon} <b>[${escapeHtml(srcBadge)}${cntBadge}]</b> <code>${escapeHtml(tLabel)}</code>\n<code>${escapeHtml(cleanSnippet)}</code>`;
+          });
+          if (hiddenCount > 0) {
+            detailLines.push(`<i>... y ${hiddenCount} tipo(s) adicional(es) en /errores.</i>`);
+          }
+          text = `${hudHeader(hasFatal ? "CENTINELA DE ERRORES \xB7 RESUMEN FINAL" : "CENTINELA DE ANOMAL\xCDAS \xB7 RESUMEN FINAL")}
 ` + hudBox([
-          `\u{1F534} <b>Tipo:</b> ${levelBadge} \xB7 <b>M\xF3dulo:</b> <code>${escapeHtml(srcBadge)}</code>`,
-          `\u{1F552} <b>Hora (Cuba):</b> <code>${escapeHtml(timeCuba)}</code>`,
-          item.repeatCount > 1 ? `\u{1F501} <b>Repeticiones agrupadas:</b> ${item.repeatCount}x en los \xFAltimos min` : null
-        ]) + `
+            item.contextTitle ? `\u{1F3AC} <b>Operaci\xF3n:</b> ${escapeHtml(item.contextTitle.slice(0, 80))}` : null,
+            `\u{1F4CA} <b>Eventos capturados:</b> ${totalOccurrences} en ${items.length} registro(s)`,
+            `\u{1F552} <b>Hora (Cuba):</b> <code>${escapeHtml(timeRange)}</code>`
+          ]) + `
+${hudSection("Detalle consolidado")}
+<blockquote>${detailLines.join("\n\n")}</blockquote>
+
+<i>\u{1F4A1} Agrupado al cierre de la operaci\xF3n. Revisa o silencia en /errores.</i>`;
+        } else {
+          const timeCuba = formatCubaTimeShort(item.timestamp);
+          const cleanMsg = sanitizeAlertOutputText(item.message).slice(0, 1400);
+          const levelBadge = item.level === "error" ? "\u{1F6A8} ERROR" : "\u26A0\uFE0F ANOMAL\xCDA";
+          const srcBadge = String(item.source || "system").toUpperCase();
+          text = `${hudHeader("CENTINELA DE ERRORES \xB7 ALERTA")}
+` + hudBox([
+            `\u{1F534} <b>Tipo:</b> ${levelBadge} \xB7 <b>M\xF3dulo:</b> <code>${escapeHtml(srcBadge)}</code>`,
+            `\u{1F552} <b>Hora (Cuba):</b> <code>${escapeHtml(timeCuba)}</code>`,
+            item.repeatCount > 1 ? `\u{1F501} <b>Repeticiones agrupadas:</b> ${item.repeatCount}x en los \xFAltimos min` : null
+          ]) + `
 ${hudSection("Detalle detectado")}
 <blockquote><code>${escapeHtml(cleanMsg)}</code></blockquote>
 
 <i>\u{1F4A1} Puedes revisar el historial completo o silenciar temporalmente con /errores.</i>`;
+        }
         const kb = [
           [
             { text: "\u{1FA7A} Ver Errores (/errores)", callback_data: "errlog:open" },
@@ -5701,17 +5800,18 @@ function recordAndMaybeAlertError(source, level, message, forceNotify = false) {
     return;
   }
   const now = Date.now();
+  const isoNow = new Date(now).toISOString();
   const sig = buildErrorSignature(source, cleanMsg);
   const existingHist = (errorSentinelSettings.recentEvents || []).find((e) => e.signature === sig && now - new Date(e.timestamp).getTime() < ERROR_ALERT_COOLDOWN_MS);
   if (existingHist) {
     existingHist.count = (existingHist.count || 1) + 1;
-    existingHist.timestamp = new Date(now).toISOString();
+    existingHist.timestamp = isoNow;
     existingHist.message = cleanMsg.slice(0, 500);
   } else {
     errorSentinelSettings.recentEvents = [
       {
         id: `${now}-${Math.random().toString(36).slice(2, 6)}`,
-        timestamp: new Date(now).toISOString(),
+        timestamp: isoNow,
         source: String(source || "system"),
         level: String(level || "error"),
         message: cleanMsg.slice(0, 500),
@@ -5726,31 +5826,56 @@ function recordAndMaybeAlertError(source, level, message, forceNotify = false) {
   if (!errorSentinelSettings.enabled && !forceNotify) return;
   if (errorSentinelSettings.mutedUntilMs > now && !forceNotify) return;
   if (IS_PREVIEW_INSTANCE) return;
-  const dedup = errorAlertDedupMap.get(sig);
-  if (!forceNotify && dedup && now - dedup.lastSentAt < ERROR_ALERT_COOLDOWN_MS) {
-    dedup.suppressedCount += 1;
-    dedup.lastMessage = cleanMsg;
+  if (forceNotify) {
+    if (adminErrorAlertQueue.length < 15) {
+      adminErrorAlertQueue.push({
+        kind: "single",
+        timestamp: isoNow,
+        source,
+        level,
+        message: cleanMsg,
+        repeatCount: 1
+      });
+      void pumpAdminErrorAlerts();
+    }
     return;
   }
-  const repeatCount = dedup ? dedup.suppressedCount + 1 : 1;
-  errorAlertDedupMap.set(sig, {
-    lastSentAt: now,
-    suppressedCount: 0,
-    lastMessage: cleanMsg
-  });
-  if (errorAlertDedupMap.size > 200) {
-    const firstKey = errorAlertDedupMap.keys().next().value;
-    if (firstKey) errorAlertDedupMap.delete(firstKey);
-  }
-  if (adminErrorAlertQueue.length < 15) {
-    adminErrorAlertQueue.push({
-      timestamp: new Date(now).toISOString(),
-      source,
-      level,
-      message: cleanMsg,
-      repeatCount
+  const opActive = isBotOperationActive();
+  if (!opActive) {
+    const dedup = errorAlertDedupMap.get(sig);
+    if (dedup && now - dedup.lastSentAt < ERROR_ALERT_COOLDOWN_MS) {
+      dedup.suppressedCount += 1;
+      dedup.lastMessage = cleanMsg;
+      return;
+    }
+    errorAlertDedupMap.set(sig, {
+      lastSentAt: now,
+      suppressedCount: 0,
+      lastMessage: cleanMsg
     });
-    void pumpAdminErrorAlerts();
+    if (errorAlertDedupMap.size > 200) {
+      const firstKey = errorAlertDedupMap.keys().next().value;
+      if (firstKey) errorAlertDedupMap.delete(firstKey);
+    }
+  }
+  const existingPending = pendingOperationErrorAlerts.find((it) => it.signature === sig && it.level === level);
+  if (existingPending) {
+    existingPending.count += 1;
+    existingPending.lastTimestamp = isoNow;
+    existingPending.message = cleanMsg.slice(0, 500);
+  } else if (pendingOperationErrorAlerts.length < 30) {
+    pendingOperationErrorAlerts.push({
+      signature: sig,
+      source: String(source || "system"),
+      level: String(level || "error"),
+      firstTimestamp: isoNow,
+      lastTimestamp: isoNow,
+      message: cleanMsg.slice(0, 500),
+      count: 1
+    });
+  }
+  if (!opActive) {
+    scheduleErrorBatchFlush(3e3, undefined, false);
   }
 }
 function addLiveLog(source, level, message) {
@@ -5851,7 +5976,7 @@ async function sendOrEditErrorSentinelMenuInTelegram(chatId, messageId, replyToM
 ${hudSection(`\xDAltimos Eventos Detectados (${recent.length})`)}
 ${eventLines.join("\n")}
 
-<i>\u{1F4A1} Cada error inesperado se env\xEDa autom\xE1ticamente a este chat con filtro anti-flood de 5 min por firma repetida.</i>`;
+<i>\u{1F4A1} Los errores durante una operaci\xF3n se agrupan y se env\xEDan al finalizar en 1 solo mensaje resumen.</i>`;
   const keyboard = [
     [
       {
@@ -10153,7 +10278,7 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
           throw s3Err instanceof Error ? s3Err : new Error(errMsg);
         }
         if (attempt < maxS3Attempts) {
-          const backoffSec = Math.min(20, attempt * 5);
+          const backoffSec = attempt <= 2 ? attempt * 5 : Math.min(35, attempt * 8);
           addLiveLog(
             "picta",
             "warn",
@@ -11512,6 +11637,7 @@ async function runDownloadStage(job) {
   syncActiveJobId();
   runningJobIds.add(job.id);
   startCloudRunCpuKeepAlive();
+  let downloadStageFailed = false;
   const { channelId, channelName } = resolveJobTargetChannelInfo(job);
   let statusMsgId = job.statusMessageId || null;
   try {
@@ -11584,6 +11710,7 @@ ${stage2Note}`,
       saveJobsToDisk();
     }
   } catch (err) {
+    downloadStageFailed = true;
     await handleJobPipelineFailure(job, statusMsgId, err);
   } finally {
     runningJobIds.delete(job.id);
@@ -11592,6 +11719,13 @@ ${stage2Note}`,
     }
     syncActiveJobId();
     stopCloudRunCpuKeepAlive();
+    if (downloadStageFailed) {
+      scheduleErrorBatchFlush(800, job.title || job.fileName, true);
+    } else if (!activeUploadJobId && isQueueTimerHoldingUpload() && !job.encoderRetryActive) {
+      scheduleErrorBatchFlush(1200, job.title || job.fileName, true);
+    } else {
+      scheduleErrorBatchFlush(1500, job.title || job.fileName, false);
+    }
     setTimeout(() => {
       void scheduleTransferPipeline();
     }, 50);
@@ -11739,6 +11873,7 @@ async function runUploadStage(job) {
     }
     syncActiveJobId();
     stopCloudRunCpuKeepAlive();
+    scheduleErrorBatchFlush(800, job.title || job.fileName, true);
     setTimeout(() => {
       void scheduleTransferPipeline();
     }, 50);
@@ -12741,6 +12876,8 @@ async function executeMultiPartJoinAndCreateJobInTelegram(chatId, messageId) {
       void 0,
       `\u274C <b>Error al unir/descomprimir en el disco ef\xEDmero:</b> <code>${escapeHtml(errMsg.slice(0, 180))}</code>`
     );
+  } finally {
+    scheduleErrorBatchFlush(800, "Uni\xF3n multiparte (/unir)", true);
   }
 }
 function isTransferJobRunningOrProcessing(excludeJobId) {
@@ -21337,6 +21474,7 @@ Esta acci\xF3n eliminar\xE1 o retirar\xE1 el cap\xEDtulo/video de tu canal en Pi
       } else if (data === "errlog:clear") {
         errorSentinelSettings.recentEvents = [];
         errorAlertDedupMap.clear();
+        pendingOperationErrorAlerts = [];
         saveErrorSentinelToDisk();
         noticeMsg = "\u{1F9F9} <b>Historial de errores limpiado.</b>";
         await callTelegramBotApi("answerCallbackQuery", { callback_query_id: cq.id, text: "Historial limpiado" }).catch(() => {});
