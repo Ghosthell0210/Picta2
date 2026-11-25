@@ -13,6 +13,7 @@ import fs3 from "fs";
 import path3 from "path";
 import http from "http";
 import https from "https";
+import dns from "dns";
 import crypto from "crypto";
 import zlib from "zlib";
 import { URL as URL2 } from "url";
@@ -8145,15 +8146,17 @@ async function resetAndReconnectMtprotoClient(reason) {
   }
   return ensureMtprotoClient();
 }
-async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onProgress, jobId, peerId, messageId) {
+async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onProgress, jobId, peerId, messageId, options = {}) {
   const CHUNK_TIMEOUT_MS = 22e3;
   const MAX_WRITE_BEHIND_BYTES = 16 * 1024 * 1024;
+  const singleSocketFallback = Boolean(options?.singleSocketFallback);
   const checkpointFilePath = `${outputFilePath}.part.json`;
   const allChunks = buildDirectDownloadChunks(
     totalBytes,
     MTPROTO_TURBO_CHUNK_BYTES
   );
   const completedOffsetsSet = /* @__PURE__ */ new Set();
+  const parentBlockReceivedMap = /* @__PURE__ */ new Map();
   let resumedBytesFromDisk = 0;
   let canResumeExistingPart = false;
   try {
@@ -8167,7 +8170,7 @@ async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onP
             completedOffsetsSet.add(n);
           }
         }
-        if (completedOffsetsSet.size > 0 && completedOffsetsSet.size < allChunks.length) {
+        if (completedOffsetsSet.size > 0 && completedOffsetsSet.size <= allChunks.length) {
           canResumeExistingPart = true;
         }
       }
@@ -8186,6 +8189,22 @@ async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onP
     } else {
       pendingQueue.push(ch);
     }
+  }
+  if (canResumeExistingPart && pendingQueue.length === 0 && totalBytes > 0) {
+    try {
+      if (fs3.existsSync(checkpointFilePath)) {
+        fs3.unlinkSync(checkpointFilePath);
+      }
+    } catch {
+    }
+    await fileHandle.close().catch(() => {
+    });
+    onProgress(totalBytes, totalBytes, {
+      dcId: Number(doc.dcId) || 1,
+      activeSockets: 1,
+      maxSockets: 1
+    });
+    return;
   }
   if (canResumeExistingPart && resumedBytesFromDisk > 0) {
     addLiveLog(
@@ -8222,7 +8241,7 @@ async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onP
   };
   let currentDcId = Number(doc.dcId) || 1;
   let currentFileReference = Buffer.isBuffer(doc.fileReference) ? doc.fileReference : Buffer.from(doc.fileReference || []);
-  let force512KbMode = false;
+  let force512KbMode = singleSocketFallback;
   const initialQueueLen = Math.max(1, pendingQueue.length);
   let downloadedBytes = resumedBytesFromDisk;
   let fatalError = null;
@@ -8237,6 +8256,15 @@ async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onP
       if (isFullTopLevelChunk) {
         completedOffsetsSet.add(offset);
         persistChunkCheckpointToDisk(false);
+      } else if (totalBytes > 0 && MTPROTO_TURBO_CHUNK_BYTES > 0) {
+        const parentOffset = Math.floor(offset / MTPROTO_TURBO_CHUNK_BYTES) * MTPROTO_TURBO_CHUNK_BYTES;
+        const parentExpected = Math.min(MTPROTO_TURBO_CHUNK_BYTES, Math.max(0, totalBytes - parentOffset));
+        const acc = (parentBlockReceivedMap.get(parentOffset) || 0) + buf.length;
+        parentBlockReceivedMap.set(parentOffset, acc);
+        if (parentExpected > 0 && acc >= parentExpected) {
+          completedOffsetsSet.add(parentOffset);
+          persistChunkCheckpointToDisk(false);
+        }
       }
     }).catch((wErr) => {
       if (!diskWriteError) {
@@ -8261,7 +8289,7 @@ async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onP
       cancelAbort.abort();
     }
   }, 350) : null;
-  const desiredTotalSockets = computePoolWarmupCount(totalBytes, MTPROTO_TCP_POOL_SIZE);
+  const desiredTotalSockets = singleSocketFallback ? 1 : computePoolWarmupCount(totalBytes, MTPROTO_TCP_POOL_SIZE);
   const slotClients = [client];
   const senderSlots = [null];
   const inFlightCounts = [0];
@@ -8339,8 +8367,24 @@ async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onP
       }
       const homeDcId = Number(targetClient.session?.dcId) || void 0;
       if (shouldUseMainClientSenderForPrimarySlot(targetDcId, homeDcId)) {
-        const mainSender = targetClient._sender || await targetClient.getSender(void 0);
-        if (mainSender && !mainSender.isConnected?.() && typeof mainSender.connect === "function") {
+        let mainSender = targetClient._sender || await targetClient.getSender(void 0);
+        if (forceFreshExport && mainSender) {
+          try {
+            if (typeof mainSender.disconnect === "function") {
+              await mainSender.disconnect().catch(() => {
+              });
+            } else if (typeof targetClient.disconnect === "function") {
+              await targetClient.disconnect().catch(() => {
+              });
+            }
+          } catch {
+          }
+          try {
+            await targetClient.connect();
+          } catch {
+          }
+          mainSender = targetClient._sender || await targetClient.getSender(void 0);
+        } else if (mainSender && !mainSender.isConnected?.() && typeof mainSender.connect === "function") {
           try {
             await mainSender.connect();
           } catch {
@@ -8594,30 +8638,37 @@ async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onP
               onAbortHandler = () => reject(new Error("SUBIDA_CANCELADA_POR_USUARIO"));
               cancelAbort.signal.addEventListener("abort", onAbortHandler, { once: true });
             });
-            const chunkStartMs = Date.now();
-            const res = await Promise.race([
-              slotClient.invokeWithSender(req, sender),
-              timeoutPromise,
-              abortPromise
-            ]);
-            if (res && res.bytes) {
-              const buf = Buffer.isBuffer(res.bytes) ? res.bytes : Buffer.from(res.bytes);
-              if (buf.length === 0) {
-                throw new Error("Respuesta de bytes vac\xEDa de Telegram");
+              if (!sender) {
+                throw new Error("MTProto sender no disponible temporalmente");
               }
-              const isCompleteTopChunk = !force512KbMode && chunk.requestLimit === MTPROTO_TURBO_CHUNK_BYTES && buf.length >= chunk.expectedBytes;
-              await enqueueChunkDiskWrite(buf, chunk.offset, isCompleteTopChunk);
-              downloadedBytes += buf.length;
-              slotChunkCounts[chosenSlotIdx] = (slotChunkCounts[chosenSlotIdx] || 0) + 1;
-              slotConsecutiveErrors[chosenSlotIdx] = 0;
-              completedChunks++;
-              totalChunkLatencyMs += Math.max(1, Date.now() - chunkStartMs);
-              lastReturnedChunkBytes = buf.length;
-              onProgress(Math.min(downloadedBytes, totalBytes), totalBytes, {
-                dcId: currentDcId,
-                activeSockets: getActiveSocketCount(),
-                maxSockets: desiredTotalSockets
-              });
+              const chunkStartMs = Date.now();
+              const res = await Promise.race([
+                slotClient.invokeWithSender(req, sender),
+                timeoutPromise,
+                abortPromise
+              ]);
+              if (res && res.bytes) {
+                const buf = Buffer.isBuffer(res.bytes) ? res.bytes : Buffer.from(res.bytes);
+                if (buf.length === 0) {
+                  throw new Error("Respuesta de bytes vac\xEDa de Telegram");
+                }
+                const isCompleteTopChunk = !force512KbMode && chunk.requestLimit === MTPROTO_TURBO_CHUNK_BYTES && buf.length >= chunk.expectedBytes;
+                await enqueueChunkDiskWrite(buf, chunk.offset, isCompleteTopChunk);
+                downloadedBytes += buf.length;
+                slotChunkCounts[chosenSlotIdx] = (slotChunkCounts[chosenSlotIdx] || 0) + 1;
+                slotConsecutiveErrors[chosenSlotIdx] = 0;
+                completedChunks++;
+                totalChunkLatencyMs += Math.max(1, Date.now() - chunkStartMs);
+                lastReturnedChunkBytes = buf.length;
+                const netDownloadedNow = Math.max(0, downloadedBytes - resumedBytesFromDisk);
+                const netElapsedSecNow = Math.max(0.5, (Date.now() - downloadStartTimeMs) / 1e3);
+                const liveNetSpeedMBps = Number((netDownloadedNow / (1024 * 1024) / netElapsedSecNow).toFixed(2));
+                onProgress(Math.min(downloadedBytes, totalBytes), totalBytes, {
+                  dcId: currentDcId,
+                  activeSockets: getActiveSocketCount(),
+                  maxSockets: desiredTotalSockets,
+                  speedMBps: liveNetSpeedMBps
+                });
               if (buf.length < chunk.expectedBytes && buf.length % 4096 === 0) {
                 const remOffset = chunk.offset + buf.length;
                 const remExpected = chunk.expectedBytes - buf.length;
@@ -8737,7 +8788,7 @@ async function downloadDocumentFast(client, doc, outputFilePath, totalBytes, onP
         }
       }
     };
-    const workerCount = Math.min(MTPROTO_SAFE_PARALLEL_WORKERS, Math.max(1, initialQueueLen));
+    const workerCount = singleSocketFallback ? Math.min(2, Math.max(1, initialQueueLen)) : Math.min(MTPROTO_SAFE_PARALLEL_WORKERS, Math.max(1, initialQueueLen));
     await Promise.all(Array.from({ length: workerCount }, () => worker()));
     if (pendingWritePromises.size > 0) {
       await Promise.allSettled(Array.from(pendingWritePromises));
@@ -8988,7 +9039,12 @@ async function downloadFullVideoFromTelegram(job, statusMsgId) {
   const resolvedLinkPeer = isTelegramLinkSource ? /^-?\d+$/.test(String(job.sourcePeerRef)) ? Number(job.sourcePeerRef) : String(job.sourcePeerRef) : Number(job.telegramChatId);
   const resolvedMsgIdForMtproto = isTelegramLinkSource ? Number(job.sourceMessageId) : job.telegramMessageId;
   const peerId = Number(job.telegramChatId);
-  const startTime = Date.now();
+  let phaseStartTimeMs = Date.now();
+  let phaseBaseBytes = 0;
+  const resetProgressPhase = (baseBytes = 0) => {
+    phaseStartTimeMs = Date.now();
+    phaseBaseBytes = Math.max(0, Number(baseBytes || 0));
+  };
   let lastNetTelemetry = {
     dcId: 1,
     activeSockets: 1,
@@ -8996,11 +9052,20 @@ async function downloadFullVideoFromTelegram(job, statusMsgId) {
   };
   const onProgress = (downNum, totalNum, telemetry) => {
     if (telemetry) {
-      lastNetTelemetry = telemetry;
+      lastNetTelemetry = {
+        dcId: telemetry.dcId ?? lastNetTelemetry.dcId,
+        activeSockets: telemetry.activeSockets ?? lastNetTelemetry.activeSockets,
+        maxSockets: telemetry.maxSockets ?? lastNetTelemetry.maxSockets
+      };
     }
     job.downloadedBytes = downNum;
-    const elapsedSec = Math.max(0.5, (Date.now() - startTime) / 1e3);
-    job.speedMBps = Number((downNum / (1024 * 1024) / elapsedSec).toFixed(2));
+    if (typeof telemetry?.speedMBps === "number" && Number.isFinite(telemetry.speedMBps)) {
+      job.speedMBps = telemetry.speedMBps;
+    } else {
+      const elapsedSec = Math.max(0.5, (Date.now() - phaseStartTimeMs) / 1e3);
+      const netDelta = Math.max(0, downNum - phaseBaseBytes);
+      job.speedMBps = Number((netDelta / (1024 * 1024) / elapsedSec).toFixed(2));
+    }
     const pct = totalNum > 0 ? Math.min(100, Math.round(downNum / totalNum * 100)) : 0;
     const netHud = formatMtprotoDownloadHudLine({
       dcId: lastNetTelemetry.dcId,
@@ -9036,6 +9101,7 @@ async function downloadFullVideoFromTelegram(job, statusMsgId) {
   let fastDownloadDone = false;
   if (decodedFid && decodedFid.valid && job.expectedBytes > 0) {
     lastNetTelemetry.dcId = decodedFid.dcId;
+    resetProgressPhase(0);
     try {
       addLiveLog(
         "mtproto",
@@ -9056,8 +9122,8 @@ async function downloadFullVideoFromTelegram(job, statusMsgId) {
         job.expectedBytes,
         onProgress,
         job.id,
-        peerId,
-        job.telegramMessageId
+        resolvedLinkPeer,
+        resolvedMsgIdForMtproto
       );
       fastDownloadDone = true;
     } catch (directFidErr) {
@@ -9068,7 +9134,7 @@ async function downloadFullVideoFromTelegram(job, statusMsgId) {
       addLiveLog(
         "mtproto",
         "warn",
-        `Aviso en descarga directa por file_id (${fidErrMsg}). Resolviendo mensaje #${job.telegramMessageId} para refrescar referencia...`
+        `Aviso en descarga directa por file_id (${fidErrMsg}). Resolviendo mensaje #${resolvedMsgIdForMtproto} para refrescar referencia...`
       );
       if (/AUTH_KEY_DUPLICATED|AUTH_KEY_UNREGISTERED|SESSION_REVOKED/i.test(fidErrMsg)) {
         const freshClient = await resetAndReconnectMtprotoClient(fidErrMsg);
@@ -9116,6 +9182,7 @@ async function downloadFullVideoFromTelegram(job, statusMsgId) {
     }
     if (doc && doc.id && doc.accessHash && docSize > 0) {
       lastNetTelemetry.dcId = Number(doc.dcId) || lastNetTelemetry.dcId;
+      resetProgressPhase(0);
       try {
         addLiveLog(
           "mtproto",
@@ -9140,7 +9207,7 @@ async function downloadFullVideoFromTelegram(job, statusMsgId) {
         addLiveLog(
           "mtproto",
           "warn",
-          `Aviso en descarga turbo MTProto: ${errMsg}. Reintentando con m\xE9todo GramJS est\xE1ndar...`
+          `Aviso en descarga turbo MTProto: ${errMsg}. Reanudando con socket \xFAnico seguro (512 KB, conservando checkpoint)...`
         );
         if (/AUTH_KEY_DUPLICATED|AUTH_KEY_UNREGISTERED|SESSION_REVOKED/i.test(errMsg)) {
           const freshClient = await resetAndReconnectMtprotoClient(errMsg);
@@ -9154,17 +9221,69 @@ async function downloadFullVideoFromTelegram(job, statusMsgId) {
             }
           }
         }
-        await client.downloadMedia(msg.media, {
-          outputFile: targetFilePath,
-          progressCallback: (downloaded, total) => {
-            if (cancelledJobIds.has(job.id)) {
-              throw new Error("SUBIDA_CANCELADA_POR_USUARIO");
-            }
-            onProgress(Number(downloaded), Number(total) || job.expectedBytes);
+        const safeResumeDoc = msg.media?.document || doc;
+        let singleResumeDone = false;
+        try {
+          resetProgressPhase(0);
+          lastNetTelemetry = {
+            dcId: Number(safeResumeDoc?.dcId) || lastNetTelemetry.dcId,
+            activeSockets: 1,
+            maxSockets: 1
+          };
+          await downloadDocumentFast(
+            client,
+            safeResumeDoc,
+            targetFilePath,
+            docSize,
+            onProgress,
+            job.id,
+            resolvedLinkPeer,
+            resolvedMsgIdForMtproto,
+            { singleSocketFallback: true }
+          );
+          singleResumeDone = true;
+        } catch (singleErr) {
+          const singleErrMsg = singleErr instanceof Error ? singleErr.message : String(singleErr);
+          if (singleErrMsg.includes("SUBIDA_CANCELADA_POR_USUARIO") || cancelledJobIds.has(job.id)) {
+            throw new Error("SUBIDA_CANCELADA_POR_USUARIO");
           }
-        });
+          addLiveLog(
+            "mtproto",
+            "warn",
+            `Reanudaci\xF3n segura 512 KB fall\xF3 (${singleErrMsg}). Usando m\xE9todo GramJS est\xE1ndar como \xFAltimo recurso...`
+          );
+        }
+        if (!singleResumeDone) {
+          try {
+            if (fs3.existsSync(`${targetFilePath}.part.json`)) {
+              fs3.unlinkSync(`${targetFilePath}.part.json`);
+            }
+          } catch {
+          }
+          resetProgressPhase(0);
+          lastNetTelemetry = {
+            dcId: Number(doc.dcId) || lastNetTelemetry.dcId,
+            activeSockets: 1,
+            maxSockets: 1
+          };
+          await client.downloadMedia(msg.media, {
+            outputFile: targetFilePath,
+            progressCallback: (downloaded, total) => {
+              if (cancelledJobIds.has(job.id)) {
+                throw new Error("SUBIDA_CANCELADA_POR_USUARIO");
+              }
+              onProgress(Number(downloaded), Number(total) || job.expectedBytes);
+            }
+          });
+        }
       }
     } else {
+      resetProgressPhase(0);
+      lastNetTelemetry = {
+        dcId: Number(doc?.dcId) || lastNetTelemetry.dcId,
+        activeSockets: 1,
+        maxSockets: 1
+      };
       await client.downloadMedia(msg.media, {
         outputFile: targetFilePath,
         progressCallback: (downloaded, total) => {
@@ -9178,8 +9297,8 @@ async function downloadFullVideoFromTelegram(job, statusMsgId) {
     job.downloadedBytes = finalSize;
     job.diskVerifiedBytes = finalSize;
   }
-  const totalDurationSec = Math.max(0.5, (Date.now() - startTime) / 1e3);
-  const avgSpeed = Number((job.downloadedBytes / (1024 * 1024) / totalDurationSec).toFixed(2));
+  const totalDurationSec = Math.max(0.5, (Date.now() - phaseStartTimeMs) / 1e3);
+  const avgSpeed = job.speedMBps > 0 ? job.speedMBps : Number((job.downloadedBytes / (1024 * 1024) / totalDurationSec).toFixed(2));
   job.speedMBps = avgSpeed;
   await editTelegramStatusMessage(
     job.telegramChatId,
@@ -9576,7 +9695,7 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
   }
   saveJobsToDisk();
   const fileSize = filePath && fs3.existsSync(filePath) ? fs3.statSync(filePath).size : job.diskVerifiedBytes || job.expectedBytes;
-  const maxS3Attempts = 5;
+  const maxS3Attempts = 6;
   let finalMinioKey = job.minioKey || "";
   if (finalMinioKey) {
     addLiveLog(
@@ -9588,6 +9707,7 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
     if (!filePath || !fs3.existsSync(filePath)) {
       throw new Error("Archivo local no encontrado en disco scratch para subir a S3 Picta.");
     }
+    let cachedS3Ipv4List = [];
     for (let attempt = 1; attempt <= maxS3Attempts; attempt++) {
       try {
         const minioCredRes = await fetchPictaWithRetry(
@@ -9648,6 +9768,18 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
         job.uploadedBytes = 0;
         job.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
         saveJobsToDisk();
+        const parsedS3Url = new URL2(s3Endpoint);
+        if (cachedS3Ipv4List.length === 0) {
+          try {
+            const resolvedIps = await dns.promises.resolve4(parsedS3Url.hostname);
+            if (Array.isArray(resolvedIps) && resolvedIps.length > 0) {
+              cachedS3Ipv4List = resolvedIps;
+            }
+          } catch {
+          }
+        }
+        const targetConnectHost = cachedS3Ipv4List.length > 0 ? cachedS3Ipv4List[(attempt - 1) % cachedS3Ipv4List.length] : parsedS3Url.hostname;
+        const targetIpHint = cachedS3Ipv4List.length > 0 ? `${targetConnectHost}` : parsedS3Url.hostname;
         await editTelegramStatusMessage(
           job.telegramChatId,
           statusMsgId,
@@ -9656,7 +9788,7 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
             `\u{1F3AC} <b>T\xEDtulo:</b> ${escapeHtml(job.title)}`,
             `\u{1F511} <b>Manifiesto MinIO:</b> <code>${candidateMinioKey}</code> (en tr\xE1nsito)`,
             `\u{1F4E4} <b>Tama\xF1o a enviar:</b> ${formatBytes(fileSize)}`,
-            attempt > 1 ? `\u{1F504} <b>Intento S3:</b> ${attempt}/${maxS3Attempts}` : null
+            attempt > 1 ? `\u{1F504} <b>Intento S3:</b> ${attempt}/${maxS3Attempts} (${escapeHtml(targetIpHint)})` : null
           ]) + `
 \u23F3 <i>Iniciando transmisi\xF3n directa hacia videos.picta.cu...</i>`,
           void 0,
@@ -9665,7 +9797,7 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
         addLiveLog(
           "picta",
           "info",
-          `Subiendo archivo 100% entero (${formatBytes(fileSize)}) a S3 MinIO (${s3Endpoint}, key: ${candidateMinioKey}, intento ${attempt}/${maxS3Attempts})...`
+          `Subiendo archivo 100% entero (${formatBytes(fileSize)}) a S3 MinIO (${s3Endpoint}, nodo=${targetIpHint}, key: ${candidateMinioKey}, intento ${attempt}/${maxS3Attempts})...`
         );
         const boundary = `----PictaMinioS3Boundary${Date.now().toString(16)}`;
         const crlf = "\r\n";
@@ -9679,13 +9811,21 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
           "x-amz-date",
           "x-amz-signature"
         ];
+        const emittedKeys = /* @__PURE__ */ new Set();
         let prologueStr = "";
         for (const k of orderedS3Keys) {
           if (s3Fields[k] !== void 0) {
+            emittedKeys.add(k);
             prologueStr += `--${boundary}${crlf}`;
             prologueStr += `Content-Disposition: form-data; name="${k}"${crlf}${crlf}`;
             prologueStr += `${s3Fields[k]}${crlf}`;
           }
+        }
+        for (const [k, v] of Object.entries(s3Fields)) {
+          if (emittedKeys.has(k) || v === void 0 || v === null) continue;
+          prologueStr += `--${boundary}${crlf}`;
+          prologueStr += `Content-Disposition: form-data; name="${k}"${crlf}${crlf}`;
+          prologueStr += `${v}${crlf}`;
         }
         const safeFileName = path3.basename(job.fileName).replace(/"/g, "");
         prologueStr += `--${boundary}${crlf}`;
@@ -9695,53 +9835,78 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
         const prologueBuf = Buffer.from(prologueStr, "utf-8");
         const epilogueBuf = Buffer.from(epilogueStr, "utf-8");
         const totalContentLength = prologueBuf.byteLength + fileSize + epilogueBuf.byteLength;
-        const parsedS3Url = new URL2(s3Endpoint);
         const isHttps = parsedS3Url.protocol === "https:";
         const transport = isHttps ? https : http;
         const startTime = Date.now();
         let lastTelegramEdit = 0;
         await new Promise((resolve, reject) => {
           let settled = false;
-          let lastWriteProgressAt = Date.now();
+          const attemptStartMs = Date.now();
+          let lastWriteProgressAt = attemptStartMs;
           let allBytesSentToSocket = false;
           let stallTimer = null;
+          let activeSock = null;
+          let socketConnected = false;
+          let tlsReady = !isHttps;
+          let lastObservedSockBytesWritten = 0;
+          let readStream = null;
+          let resolveReadyWaiters: Array<() => void> = [];
+          const notifyReady = () => {
+            if (resolveReadyWaiters.length === 0) return;
+            const list = resolveReadyWaiters;
+            resolveReadyWaiters = [];
+            for (const fn of list) fn();
+          };
           const cleanupWatchdog = () => {
             if (stallTimer) {
               clearInterval(stallTimer);
               stallTimer = null;
             }
           };
-          const failOnce = (err) => {
+          const failOnce = (err: Error) => {
             if (settled) return;
             settled = true;
             cleanupWatchdog();
+            notifyReady();
+            try {
+              if (readStream && !readStream.destroyed) readStream.destroy();
+            } catch {}
+            try {
+              if (req && !req.destroyed) req.destroy(err);
+            } catch {}
             reject(err);
           };
           const succeedOnce = () => {
             if (settled) return;
             settled = true;
             cleanupWatchdog();
+            notifyReady();
             resolve();
           };
-          const req = transport.request(
-            {
-              protocol: parsedS3Url.protocol,
-              hostname: parsedS3Url.hostname,
-              port: parsedS3Url.port || (isHttps ? 443 : 80),
-              path: parsedS3Url.pathname + parsedS3Url.search,
-              method: "POST",
-              agent: false,
-              family: 4,
-              headers: {
-                "Content-Type": `multipart/form-data; boundary=${boundary}`,
-                "Content-Length": totalContentLength,
-                Connection: "close",
-                Origin: "https://admin.picta.cu",
-                Referer: "https://admin.picta.cu/"
-              }
+
+          const reqOptions: https.RequestOptions = {
+            protocol: parsedS3Url.protocol,
+            hostname: targetConnectHost,
+            port: parsedS3Url.port || (isHttps ? 443 : 80),
+            path: parsedS3Url.pathname + parsedS3Url.search,
+            method: "POST",
+            agent: false,
+            family: 4,
+            ...(isHttps ? { servername: parsedS3Url.hostname } : {}),
+            headers: {
+              Host: parsedS3Url.host,
+              "Content-Type": `multipart/form-data; boundary=${boundary}`,
+              "Content-Length": totalContentLength,
+              Connection: "close",
+              Origin: "https://admin.picta.cu",
+              Referer: "https://admin.picta.cu/",
             },
+          };
+
+          const req = transport.request(
+            reqOptions,
             (res) => {
-              const chunks = [];
+              const chunks: Buffer[] = [];
               res.on("data", (d) => chunks.push(Buffer.from(d)));
               res.on("end", () => {
                 const bodyText = Buffer.concat(chunks).toString("utf-8");
@@ -9750,7 +9915,7 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
                   job.uploadedBytes = fileSize;
                   finalMinioKey = candidateMinioKey;
                   job.minioKey = candidateMinioKey;
-                  job.pendingMinioKey = void 0;
+                  job.pendingMinioKey = undefined;
                   job.s3UploadConfirmed = true;
                   saveJobsToDisk();
                   succeedOnce();
@@ -9764,79 +9929,147 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
               });
             }
           );
+
           req.on("socket", (sock) => {
+            activeSock = sock;
             sock.setNoDelay?.(true);
-            sock.setKeepAlive?.(true, 1e4);
+            sock.setKeepAlive?.(true, 10000);
+            const onConnect = () => {
+              socketConnected = true;
+              lastWriteProgressAt = Date.now();
+              if (!isHttps) {
+                tlsReady = true;
+                notifyReady();
+              }
+            };
+            const onSecureConnect = () => {
+              socketConnected = true;
+              tlsReady = true;
+              lastWriteProgressAt = Date.now();
+              notifyReady();
+            };
+            if (!sock.connecting) {
+              socketConnected = true;
+              if (!isHttps || (sock as any).authorized === true) {
+                tlsReady = true;
+                notifyReady();
+              }
+            }
+            sock.once("connect", onConnect);
+            if (isHttps) {
+              sock.once("secureConnect", onSecureConnect);
+            }
+            sock.once("close", notifyReady);
+            sock.once("error", notifyReady);
           });
           req.setTimeout(3e5, () => {
             const pctNow = fileSize > 0 ? Math.min(100, Math.round(job.uploadedBytes / fileSize * 100)) : 0;
-            req.destroy(
-              new Error(
-                allBytesSentToSocket
-                  ? `Timeout esperando respuesta final de videos.picta.cu tras enviar 100% (${formatBytes(fileSize)})`
-                  : `Timeout de socket en videos.picta.cu en ${pctNow}% (${formatBytes(job.uploadedBytes)} / ${formatBytes(fileSize)})`
-              )
+            const err = new Error(
+              allBytesSentToSocket ? `Timeout esperando respuesta final de videos.picta.cu (${targetIpHint}) tras enviar 100% (${formatBytes(fileSize)})` : `Timeout de socket en videos.picta.cu (${targetIpHint}) en ${pctNow}% (${formatBytes(job.uploadedBytes)} / ${formatBytes(fileSize)})`
             );
+            failOnce(err);
           });
-          const readStream = fs3.createReadStream(filePath, {
-            highWaterMark: S3_UPLOAD_HIGH_WATER_MARK_BYTES
-            // 256 KB strict lean RAM profile on Ephemeral Disk
+          const streamChunkBytes = Math.min(S3_UPLOAD_HIGH_WATER_MARK_BYTES, 64 * 1024);
+          readStream = fs3.createReadStream(filePath, {
+            highWaterMark: streamChunkBytes
           });
           stallTimer = setInterval(() => {
             if (settled) {
               cleanupWatchdog();
               return;
             }
-            const idleMs = Date.now() - lastWriteProgressAt;
+            const nowMs = Date.now();
+            const sockWrittenNow = Number(activeSock?.bytesWritten || 0);
+            if (sockWrittenNow > lastObservedSockBytesWritten) {
+              lastObservedSockBytesWritten = sockWrittenNow;
+              lastWriteProgressAt = nowMs;
+            }
+            const idleMs = nowMs - lastWriteProgressAt;
             const pctNow = fileSize > 0 ? Math.min(100, Math.round(job.uploadedBytes / fileSize * 100)) : 0;
-            if (!allBytesSentToSocket && idleMs > 9e4) {
-              const stallErr = new Error(
-                `Conexi\xF3n S3 estancada 90s sin respuesta de videos.picta.cu en ${pctNow}% (${formatBytes(job.uploadedBytes)} / ${formatBytes(fileSize)})`
+            if (!tlsReady && nowMs - attemptStartMs > 25e3) {
+              const hsErr = new Error(
+                `Timeout ${socketConnected ? "TLS" : "TCP"} tras 25s conectando con videos.picta.cu (${targetIpHint}) en 0%`
               );
-              readStream.destroy();
-              req.destroy(stallErr);
+              failOnce(hsErr);
+              return;
+            }
+            if (!allBytesSentToSocket && job.uploadedBytes === 0 && idleMs > 45e3) {
+              const stallZeroErr = new Error(
+                `Conexi\xF3n S3 estancada 45s sin respuesta de videos.picta.cu (${targetIpHint}) en 0% (0 B / ${formatBytes(fileSize)}, socket=${sockWrittenNow} B)`
+              );
+              failOnce(stallZeroErr);
+            } else if (!allBytesSentToSocket && idleMs > 9e4) {
+              const stallErr = new Error(
+                `Conexi\xF3n S3 estancada 90s sin respuesta de videos.picta.cu (${targetIpHint}) en ${pctNow}% (${formatBytes(job.uploadedBytes)} / ${formatBytes(fileSize)})`
+              );
               failOnce(stallErr);
             } else if (allBytesSentToSocket && idleMs > 3e5) {
               const ackErr = new Error(
-                `Timeout esperando confirmaci\xF3n HTTP de videos.picta.cu tras enviar 100% (${formatBytes(fileSize)})`
+                `Timeout esperando confirmaci\xF3n HTTP de videos.picta.cu (${targetIpHint}) tras enviar 100% (${formatBytes(fileSize)})`
               );
-              req.destroy(ackErr);
               failOnce(ackErr);
             }
-          }, 5e3);
-          const waitForDrainOrSettled = () =>
-            new Promise((resDrain) => {
-              if (settled || req.destroyed) {
-                resDrain();
-                return;
+          }, 4e3);
+          const waitForSocketTlsReady = () => new Promise((resReady) => {
+            if (settled || req.destroyed || tlsReady) {
+              resReady();
+              return;
+            }
+            resolveReadyWaiters.push(resReady);
+          });
+          const waitForDrainOrSettled = () => new Promise((resDrain) => {
+            if (settled || req.destroyed || !req.writableNeedDrain && (!activeSock || !activeSock.writableNeedDrain)) {
+              resDrain();
+              return;
+            }
+            let finishedWait = false;
+            const sockRef = activeSock;
+            const done = () => {
+              if (finishedWait) return;
+              finishedWait = true;
+              req.off("drain", onDrain);
+              req.off("close", done);
+              req.off("error", done);
+              req.off("finish", done);
+              if (sockRef) {
+                sockRef.off("drain", onDrain);
+                sockRef.off("close", done);
+                sockRef.off("error", done);
               }
-              const done = () => {
-                req.off("drain", onDrain);
-                req.off("close", done);
-                req.off("error", done);
-                req.off("finish", done);
-                resDrain();
-              };
-              const onDrain = () => {
-                lastWriteProgressAt = Date.now();
+              clearInterval(pollDrain);
+              resDrain();
+            };
+            const onDrain = () => {
+              lastWriteProgressAt = Date.now();
+              done();
+            };
+            const pollDrain = setInterval(() => {
+              if (settled || req.destroyed || !req.writableNeedDrain && (!sockRef || !sockRef.writableNeedDrain)) {
                 done();
-              };
-              req.once("drain", onDrain);
-              req.once("close", done);
-              req.once("error", done);
-              req.once("finish", done);
-            });
+              }
+            }, 500);
+            req.once("drain", onDrain);
+            req.once("close", done);
+            req.once("error", done);
+            req.once("finish", done);
+            if (sockRef) {
+              sockRef.once("drain", onDrain);
+              sockRef.once("close", done);
+              sockRef.once("error", done);
+            }
+          });
           req.on("error", (err) => {
-            readStream.destroy();
             const detail = err?.message || err?.code || (Array.isArray(err?.errors) ? err.errors.map((e) => e?.message || e?.code).join(", ") : "Conexi\xF3n reiniciada por videos.picta.cu");
-            failOnce(new Error(`Error de red en S3 Picta: ${detail}`));
+            failOnce(new Error(`Error de red en S3 Picta (${targetIpHint}): ${detail}`));
           });
           readStream.on("error", (err) => {
-            req.destroy(err);
             failOnce(err);
           });
           void (async () => {
             try {
+              await waitForSocketTlsReady();
+              if (settled) return;
+              lastWriteProgressAt = Date.now();
               if (!req.write(prologueBuf)) {
                 await waitForDrainOrSettled();
               }
@@ -9844,7 +10077,6 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
               for await (const chunk of readStream) {
                 if (settled) break;
                 if (cancelledJobIds.has(job.id)) {
-                  req.destroy(new Error("SUBIDA_CANCELADA_POR_USUARIO"));
                   failOnce(new Error("SUBIDA_CANCELADA_POR_USUARIO"));
                   break;
                 }
@@ -9860,7 +10092,7 @@ async function uploadFullVerifiedFileToPicta(job, filePath, statusMsgId) {
                   (job.uploadedBytes / (1024 * 1024) / elapsedSec).toFixed(2)
                 );
                 const pct = Math.min(100, Math.round(job.uploadedBytes / fileSize * 100));
-                currentActivity = `Subiendo archivo entero a S3 Picta (${candidateMinioKey}): ${formatBytes(job.uploadedBytes)} / ${formatBytes(fileSize)} (${pct}%) a ${job.speedMBps} MB/s`;
+                currentActivity = `Subiendo archivo entero a S3 Picta (${candidateMinioKey} \xB7 ${targetIpHint}): ${formatBytes(job.uploadedBytes)} / ${formatBytes(fileSize)} (${pct}%) a ${job.speedMBps} MB/s`;
                 const now = Date.now();
                 if (now - lastTelegramEdit > 4e3) {
                   lastTelegramEdit = now;
