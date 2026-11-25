@@ -2363,7 +2363,7 @@ function computeEnrichedAdminUsersSummary(params) {
 // src/utils/multiPartDiskAssembler.ts
 import fs2 from "fs";
 import path2 from "path";
-import { execFile } from "child_process";
+import { execFile, spawn } from "child_process";
 import { promisify } from "util";
 var execFileAsync = promisify(execFile);
 var VIDEO_EXTS = /* @__PURE__ */ new Set([".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".ts", ".m4v"]);
@@ -3099,6 +3099,9 @@ var PROMO_CHANNELS_FILE = path3.join(STATE_DIR, "promo_channels.json");
 var PENDING_PROMOS_FILE = path3.join(STATE_DIR, "pending_promos.json");
 var CHANNEL_REQUESTS_FILE = path3.join(STATE_DIR, "channel_requests.json");
 var IGNORED_REQUEST_COMMENTS_FILE = path3.join(STATE_DIR, "ignored_comment_requests.json");
+var ERROR_SENTINEL_FILE = path3.join(STATE_DIR, "error_sentinel.json");
+var PENDING_UPDATE_NOTICE_FILE = path3.join(STATE_DIR, "pending_update_notice.json");
+var PICTA_RESTART_EXIT_CODE = 42;
 var MASTER_ADMIN_CHAT_ID = "1981484200";
 var MASTER_PRIVATE_REQUESTS_CHANNEL = {
   targetChannelId: "-1004395450472",
@@ -3143,7 +3146,9 @@ function migrateLegacyStateOnce() {
       [PROMO_CHANNELS_FILE, "promo_channels.json"],
       [PENDING_PROMOS_FILE, "pending_promos.json"],
       [path3.join(STATE_DIR, "pinned_series.json"), "pinned_series.json"],
-      [path3.join(STATE_DIR, "channel_series.json"), "channel_series.json"]
+      [path3.join(STATE_DIR, "channel_series.json"), "channel_series.json"],
+      [ERROR_SENTINEL_FILE, "error_sentinel.json"],
+      [PENDING_UPDATE_NOTICE_FILE, "pending_update_notice.json"]
     ];
     for (const [stateFile, legacyName] of pairs) {
       const legacyPath = path3.join(LEGACY_DATA_DIR, legacyName);
@@ -5543,17 +5548,226 @@ function saveProcessedUpdatesToDisk() {
   }
 }
 loadProcessedUpdatesFromDisk();
+var ERROR_ALERT_COOLDOWN_MS = 5 * 60 * 1e3;
+var MAX_ERROR_SENTINEL_HISTORY = 40;
+function loadErrorSentinelFromDisk() {
+  const defaults = {
+    enabled: true,
+    mutedUntilMs: 0,
+    includeWarnings: true,
+    totalCaught: 0,
+    recentEvents: []
+  };
+  try {
+    if (fs3.existsSync(ERROR_SENTINEL_FILE)) {
+      const parsed = JSON.parse(fs3.readFileSync(ERROR_SENTINEL_FILE, "utf-8"));
+      if (parsed && typeof parsed === "object") {
+        return {
+          enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : true,
+          mutedUntilMs: Number(parsed.mutedUntilMs || 0) || 0,
+          includeWarnings: typeof parsed.includeWarnings === "boolean" ? parsed.includeWarnings : true,
+          totalCaught: Number(parsed.totalCaught || 0) || 0,
+          recentEvents: Array.isArray(parsed.recentEvents) ? parsed.recentEvents.slice(0, MAX_ERROR_SENTINEL_HISTORY) : []
+        };
+      }
+    }
+  } catch {
+  }
+  return defaults;
+}
+var errorSentinelSettings = loadErrorSentinelFromDisk();
+function saveErrorSentinelToDisk() {
+  try {
+    const payload = {
+      enabled: errorSentinelSettings.enabled,
+      mutedUntilMs: errorSentinelSettings.mutedUntilMs,
+      includeWarnings: errorSentinelSettings.includeWarnings,
+      totalCaught: errorSentinelSettings.totalCaught,
+      recentEvents: (errorSentinelSettings.recentEvents || []).slice(0, MAX_ERROR_SENTINEL_HISTORY)
+    };
+    fs3.writeFileSync(ERROR_SENTINEL_FILE, JSON.stringify(payload, null, 2), "utf-8");
+    mirrorFileToLegacyDataDir(ERROR_SENTINEL_FILE);
+  } catch {
+  }
+}
+function sanitizeAlertOutputText(raw) {
+  let s = String(raw || "");
+  if (botConfig?.telegramBotToken) {
+    const tok = String(botConfig.telegramBotToken).trim();
+    if (tok.length > 10) {
+      s = s.split(tok).join("[BOT_TOKEN_OCULTO]");
+    }
+  }
+  if (botConfig?.pictaPassword) {
+    const pwd = String(botConfig.pictaPassword).trim();
+    if (pwd.length >= 4) {
+      s = s.split(pwd).join("[CLAVE_OCULTA]");
+    }
+  }
+  s = s.replace(/\b\d{7,12}:[A-Za-z0-9_-]{24,}\b/g, "[BOT_TOKEN_OCULTO]").replace(/Bearer\s+[A-Za-z0-9._-]{16,}/gi, "Bearer [TOKEN_OCULTO]").replace(/(password|passwd|secret|access_token|refresh_token)=([^\s&]+)/gi, "$1=[OCULTO]");
+  return s.trim();
+}
+function buildErrorSignature(source, message) {
+  const normMsg = String(message || "").toLowerCase().replace(/https?:\/\/\S+/g, "<url>").replace(/[0-9a-f]{16,}/g, "<hex>").replace(/#\d+/g, "#N").replace(/\b\d{2,}\b/g, "N").replace(/\s+/g, " ").trim().slice(0, 140);
+  return `${String(source || "system").toLowerCase()}::${normMsg}`;
+}
+function shouldNotifyAdminForEvent(source, level, message) {
+  const lvl = String(level || "").toLowerCase();
+  const src = String(source || "").toLowerCase();
+  const msg = String(message || "");
+  if (!msg) return false;
+  if (lvl !== "error" && lvl !== "warn") return false;
+  if (/\[sentinel-self\]/i.test(msg)) return false;
+  if (/Subida cancelada por usuario/i.test(msg) || /SUBIDA_CANCELADA_POR_USUARIO/i.test(msg)) return false;
+  if (/QUOTA_DAILY_LIMIT_REACHED|QUOTA_SERIE_RESERVED_REACHED|l[ií]mite diario de \d+ publicaciones/i.test(msg)) return false;
+  if (/message is not modified/i.test(msg)) return false;
+  if (/Pre-descarga pausada/i.test(msg)) return false;
+  if (lvl === "warn") {
+    if (/Auto-resolviendo|t[ií]tulo repetido/i.test(msg)) return false;
+    if (/Aviso editando mensaje/i.test(msg) && /message to edit not found|message is not modified/i.test(msg)) return false;
+    if (/Telegram DC solicit[oó] esperar \d+s/i.test(msg)) return false;
+    if (src === "mtproto" && /reconnecting|cerrando la conexi[oó]n actual|reconexi[oó]n completada/i.test(msg)) return false;
+    return /error|fall[oóe]|no se pudo|timeout|estancad|enospc|eacces|enotfound|econnrefused|econnreset|etimedout|epipe|401|403|404|409|429|500|502|503|504|corrupt|rechazad|expirad|desconect|imposible|inv[aá]lid|rot[oa]|abort|cr[ií]tico|bloquead|sin permiso/i.test(msg);
+  }
+  return true;
+}
+var errorAlertDedupMap = /* @__PURE__ */ new Map();
+var adminErrorAlertQueue = [];
+var adminErrorAlertPumpBusy = false;
+var errorSentinelNotifyingSelf = false;
+async function pumpAdminErrorAlerts() {
+  if (adminErrorAlertPumpBusy || IS_PREVIEW_INSTANCE) return;
+  adminErrorAlertPumpBusy = true;
+  try {
+    while (adminErrorAlertQueue.length > 0) {
+      const item = adminErrorAlertQueue.shift();
+      if (!item) continue;
+      if (!botConfig?.telegramBotToken?.trim()) continue;
+      errorSentinelNotifyingSelf = true;
+      try {
+        const timeCuba = new Date(item.timestamp).toLocaleTimeString("es-CU", {
+          timeZone: "America/Havana",
+          hour12: false
+        });
+        const cleanMsg = sanitizeAlertOutputText(item.message).slice(0, 1400);
+        const levelBadge = item.level === "error" ? "\u{1F6A8} ERROR" : "\u26A0\uFE0F ANOMAL\xCDA";
+        const srcBadge = String(item.source || "system").toUpperCase();
+        const text = `${hudHeader("CENTINELA DE ERRORES · ALERTA EN VIVO")}
+` + hudBox([
+          `\u{1F534} <b>Tipo:</b> ${levelBadge} \xB7 <b>M\xF3dulo:</b> <code>${escapeHtml(srcBadge)}</code>`,
+          `\u{1F552} <b>Hora (Cuba):</b> <code>${escapeHtml(timeCuba)}</code>`,
+          item.repeatCount > 1 ? `\u{1F501} <b>Repeticiones agrupadas:</b> ${item.repeatCount}x en los \xFAltimos min` : null
+        ]) + `
+${hudSection("Detalle detectado")}
+<blockquote><code>${escapeHtml(cleanMsg)}</code></blockquote>
+
+<i>\u{1F4A1} Puedes revisar el historial completo o silenciar temporalmente con /errores.</i>`;
+        const kb = [
+          [
+            { text: "\u{1FA7A} Ver Errores (/errores)", callback_data: "errlog:open" },
+            { text: "\u{1F4CB} Ver Cola", callback_data: "queue_view" }
+          ],
+          [
+            { text: "\u{1F4E1} Log MTProto", callback_data: "errlog:netlog" },
+            { text: "\u{1F515} Silenciar 30m", callback_data: "errlog:mute:30" }
+          ]
+        ];
+        await callTelegramBotApi("sendMessage", {
+          chat_id: MASTER_ADMIN_CHAT_ID,
+          text: text.length > 4090 ? `${text.slice(0, 4040)}...` : text,
+          parse_mode: "HTML",
+          reply_markup: { inline_keyboard: kb }
+        });
+      } catch (sendErr) {
+        console.error("[Sentinel-Self] Fallo enviando alerta a Telegram:", sendErr instanceof Error ? sendErr.message : String(sendErr));
+      } finally {
+        errorSentinelNotifyingSelf = false;
+      }
+      await new Promise((r) => setTimeout(r, 650));
+    }
+  } finally {
+    adminErrorAlertPumpBusy = false;
+  }
+}
+function recordAndMaybeAlertError(source, level, message, forceNotify = false) {
+  if (errorSentinelNotifyingSelf) return;
+  const cleanMsg = sanitizeAlertOutputText(message);
+  if (!cleanMsg) return;
+  if (!forceNotify && !shouldNotifyAdminForEvent(source, level, cleanMsg)) {
+    return;
+  }
+  if (!forceNotify && level === "warn" && !errorSentinelSettings.includeWarnings) {
+    return;
+  }
+  const now = Date.now();
+  const sig = buildErrorSignature(source, cleanMsg);
+  const existingHist = (errorSentinelSettings.recentEvents || []).find((e) => e.signature === sig && now - new Date(e.timestamp).getTime() < ERROR_ALERT_COOLDOWN_MS);
+  if (existingHist) {
+    existingHist.count = (existingHist.count || 1) + 1;
+    existingHist.timestamp = new Date(now).toISOString();
+    existingHist.message = cleanMsg.slice(0, 500);
+  } else {
+    errorSentinelSettings.recentEvents = [
+      {
+        id: `${now}-${Math.random().toString(36).slice(2, 6)}`,
+        timestamp: new Date(now).toISOString(),
+        source: String(source || "system"),
+        level: String(level || "error"),
+        message: cleanMsg.slice(0, 500),
+        signature: sig,
+        count: 1
+      },
+      ...errorSentinelSettings.recentEvents || []
+    ].slice(0, MAX_ERROR_SENTINEL_HISTORY);
+  }
+  errorSentinelSettings.totalCaught = (errorSentinelSettings.totalCaught || 0) + 1;
+  saveErrorSentinelToDisk();
+  if (!errorSentinelSettings.enabled && !forceNotify) return;
+  if (errorSentinelSettings.mutedUntilMs > now && !forceNotify) return;
+  if (IS_PREVIEW_INSTANCE) return;
+  const dedup = errorAlertDedupMap.get(sig);
+  if (!forceNotify && dedup && now - dedup.lastSentAt < ERROR_ALERT_COOLDOWN_MS) {
+    dedup.suppressedCount += 1;
+    dedup.lastMessage = cleanMsg;
+    return;
+  }
+  const repeatCount = dedup ? dedup.suppressedCount + 1 : 1;
+  errorAlertDedupMap.set(sig, {
+    lastSentAt: now,
+    suppressedCount: 0,
+    lastMessage: cleanMsg
+  });
+  if (errorAlertDedupMap.size > 200) {
+    const firstKey = errorAlertDedupMap.keys().next().value;
+    if (firstKey) errorAlertDedupMap.delete(firstKey);
+  }
+  if (adminErrorAlertQueue.length < 15) {
+    adminErrorAlertQueue.push({
+      timestamp: new Date(now).toISOString(),
+      source,
+      level,
+      message: cleanMsg,
+      repeatCount
+    });
+    void pumpAdminErrorAlerts();
+  }
+}
 function addLiveLog(source, level, message) {
+  const safeMessage = sanitizeAlertOutputText(message);
   const entry = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
     timestamp: (/* @__PURE__ */ new Date()).toISOString(),
     source,
     level,
-    message
+    message: safeMessage
   };
   liveLogs.unshift(entry);
   if (liveLogs.length > 300) {
     liveLogs = liveLogs.slice(0, 300);
+  }
+  try {
+    recordAndMaybeAlertError(source, level, safeMessage, false);
+  } catch {
   }
 }
 function addMtprotoDiagLog(input) {
@@ -5569,6 +5783,471 @@ function addMtprotoDiagLog(input) {
   }
   if (!skipLiveLog) {
     addLiveLog("mtproto", input.level, input.message);
+  }
+}
+async function sendOrEditMtprotoDiagInTelegram(chatId, messageId, replyToMessageId) {
+  const readyAux = Array.from(auxiliaryBotClients.values()).filter((c) => c.connected).length;
+  const cooldownSec = mtprotoAuxFloodWaitUntilMs > Date.now() ? Math.ceil((mtprotoAuxFloodWaitUntilMs - Date.now()) / 1e3) : 0;
+  const recent = mtprotoDiagLogs.slice(0, 10);
+  const lines = recent.length ? recent.map((entry) => {
+    const t = new Date(entry.timestamp).toLocaleTimeString("es-CU", {
+      timeZone: "America/Havana",
+      hour12: false
+    });
+    return `\u2022 <code>${t}</code> ${escapeHtml(entry.message)}`;
+  }) : ["\u2022 Sin eventos MTProto registrados a\xFAn en esta instancia."];
+  const textOut = `\u{1F4E1} <b>LOG DE RED Y VELOCIDAD MTPROTO</b>
+
+<blockquote>\u{1F50C} <b>Pool activo:</b> ${mtprotoConnected ? 1 : 0} principal + ${readyAux}/${Math.max(0, MTPROTO_TCP_POOL_SIZE - 1)} auxiliares
+` + (cooldownSec > 0 ? `\u23F3 <b>Enfriamiento login auxiliar:</b> ${cooldownSec}s
+` : "") + `\u{1F4CA} <b>\xDAltimos ${recent.length} eventos:</b>
+` + lines.join("\n") + `</blockquote>`;
+  const kb = [
+    [
+      { text: "\u{1F504} Actualizar Log", callback_data: "errlog:netlog" },
+      { text: "\u{1FA7A} Ver Errores", callback_data: "errlog:open" }
+    ],
+    [{ text: "\u25C8 Men\xFA Principal", callback_data: "cmd_start" }]
+  ];
+  if (messageId) {
+    await editTelegramStatusMessage(chatId, messageId, textOut, kb, true);
+  } else {
+    await sendTelegramStatusMessage(chatId, textOut, replyToMessageId, kb);
+  }
+}
+async function sendOrEditErrorSentinelMenuInTelegram(chatId, messageId, replyToMessageId, notice) {
+  if (!isMasterAdminChat(chatId)) {
+    await sendTelegramStatusMessage(
+      chatId,
+      `\u26D4 <i>El centinela autom\xE1tico de errores est\xE1 reservado para el Administrador Principal.</i>`,
+      replyToMessageId
+    );
+    return;
+  }
+  const now = Date.now();
+  const isMuted = errorSentinelSettings.mutedUntilMs > now;
+  const muteRemainingMin = isMuted ? Math.max(1, Math.ceil((errorSentinelSettings.mutedUntilMs - now) / 6e4)) : 0;
+  const statusLabel = !errorSentinelSettings.enabled ? "\u{1F534} Desactivado" : isMuted ? `\u{1F515} Silenciado (${muteRemainingMin} min restantes)` : "\u{1F7E2} Activo (Vigilando en tiempo real)";
+  const recent = (errorSentinelSettings.recentEvents || []).slice(0, 8);
+  const eventLines = recent.length > 0 ? recent.map((ev) => {
+    const t = new Date(ev.timestamp).toLocaleTimeString("es-CU", {
+      timeZone: "America/Havana",
+      hour12: false
+    });
+    const icon = ev.level === "error" ? "\u{1F6A8}" : "\u26A0\uFE0F";
+    const cnt = (ev.count || 1) > 1 ? ` (${ev.count}x)` : "";
+    return `${icon} <code>${t}</code> [<b>${escapeHtml(String(ev.source || "sys").toUpperCase())}</b>${cnt}] ${escapeHtml(String(ev.message || "").slice(0, 110))}`;
+  }) : ["\u2705 <i>Sin errores ni anomal\xEDas registradas en el historial.</i>"];
+  const textOut = (notice ? `${notice}
+
+` : "") + `${hudHeader("CENTINELA AUTOM\xC1TICO DE ERRORES")}
+` + hudBox([
+    `\u{1F6E1}\uFE0F <b>Estado:</b> ${statusLabel}`,
+    `\u26A0\uFE0F <b>Incluir advertencias an\xF3malas:</b> ${errorSentinelSettings.includeWarnings ? "\u{1F7E2} S\xED (Todo fallo anormal)" : "\u26AA Solo errores fatales"}`,
+    `\u{1F4CA} <b>Eventos detectados (hist\xF3rico):</b> <code>${errorSentinelSettings.totalCaught || 0}</code>`
+  ]) + `
+
+${hudSection(`\xDAltimos Eventos Detectados (${recent.length})`)}
+${eventLines.join("\n")}
+
+<i>\u{1F4A1} Cada error inesperado se env\xEDa autom\xE1ticamente a este chat con filtro anti-flood de 5 min por firma repetida.</i>`;
+  const keyboard = [
+    [
+      {
+        text: errorSentinelSettings.enabled ? "\u{1F7E2} Alertas: ON" : "\u{1F534} Alertas: OFF",
+        callback_data: "errlog:toggle"
+      },
+      {
+        text: errorSentinelSettings.includeWarnings ? "\u26A0\uFE0F Anomal\xEDas: ON" : "\u26AA Solo Cr\xEDticos",
+        callback_data: "errlog:warnings"
+      }
+    ],
+    isMuted ? [
+      { text: "\u{1F514} Reactivar Sonido Ahora", callback_data: "errlog:mute:0" },
+      { text: "\u{1F504} Actualizar", callback_data: "errlog:open" }
+    ] : [
+      { text: "\u{1F515} Silenciar 30m", callback_data: "errlog:mute:30" },
+      { text: "\u{1F507} Silenciar 2h", callback_data: "errlog:mute:120" }
+    ],
+    [
+      { text: "\u{1F9EA} Probar Alerta", callback_data: "errlog:test" },
+      { text: "\u{1F9F9} Limpiar Historial", callback_data: "errlog:clear" }
+    ],
+    [
+      { text: "\u{1F4E1} Log MTProto", callback_data: "errlog:netlog" },
+      { text: "\u{1F504} Actualizar", callback_data: "errlog:open" }
+    ],
+    [{ text: "\u25C8 Men\xFA Principal", callback_data: "cmd_start" }]
+  ];
+  if (messageId) {
+    await editTelegramStatusMessage(chatId, messageId, textOut, keyboard, true);
+  } else {
+    await sendTelegramStatusMessage(chatId, textOut, replyToMessageId, keyboard);
+  }
+}
+var botUpdateInProgress = false;
+var activeHttpServerRef = null;
+async function runGitCommandSafe(args, timeoutMs = 25e3) {
+  const { stdout, stderr } = await execFileAsync("git", args, {
+    cwd: process.cwd(),
+    timeout: timeoutMs,
+    maxBuffer: 2 * 1024 * 1024
+  });
+  return {
+    stdout: sanitizeAlertOutputText(String(stdout || "").trim()),
+    stderr: sanitizeAlertOutputText(String(stderr || "").trim())
+  };
+}
+async function inspectGitUpdateStatus(doFetch = true) {
+  const repoRoot = process.cwd();
+  const hasGitDir = fs3.existsSync(path3.join(repoRoot, ".git"));
+  if (!hasGitDir) {
+    return {
+      hasGit: false,
+      branch: "desconocida",
+      localCommit: "sin-git",
+      localMessage: "",
+      remoteCommit: "",
+      aheadCommits: [],
+      dirtyFiles: [],
+      remoteError: "El directorio actual no contiene un repositorio .git."
+    };
+  }
+  let branch = "main";
+  let localCommit = "";
+  let localMessage = "";
+  let remoteCommit = "";
+  let aheadCommits = [];
+  let dirtyFiles = [];
+  let remoteError = "";
+  try {
+    const bRes = await runGitCommandSafe(["rev-parse", "--abbrev-ref", "HEAD"]);
+    if (bRes.stdout && bRes.stdout !== "HEAD") {
+      const candidateBranch = bRes.stdout.split(/\s+/)[0] || "main";
+      if (/^[A-Za-z0-9._/-]+$/.test(candidateBranch) && !candidateBranch.startsWith("-")) {
+        branch = candidateBranch;
+      }
+    }
+    const cRes = await runGitCommandSafe(["rev-parse", "--short", "HEAD"]);
+    localCommit = cRes.stdout || "";
+    const mRes = await runGitCommandSafe(["log", "-1", "--pretty=%s (%cr)"]);
+    localMessage = mRes.stdout || "";
+    const stRes = await runGitCommandSafe(["status", "--porcelain"]);
+    if (stRes.stdout) {
+      dirtyFiles = stRes.stdout.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("??"));
+    }
+  } catch (err) {
+    remoteError = sanitizeAlertOutputText(err instanceof Error ? err.message : String(err));
+  }
+  if (doFetch && !remoteError) {
+    try {
+      await runGitCommandSafe(["fetch", "origin", branch], 3e4);
+      const rRes = await runGitCommandSafe(["rev-parse", "--short", `origin/${branch}`]);
+      remoteCommit = rRes.stdout || "";
+      const logRes = await runGitCommandSafe(["log", `HEAD..origin/${branch}`, "--oneline", "-n", "12"]);
+      if (logRes.stdout) {
+        aheadCommits = logRes.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+      }
+    } catch (err) {
+      remoteError = sanitizeAlertOutputText(err instanceof Error ? err.message : String(err));
+    }
+  }
+  return {
+    hasGit: true,
+    branch,
+    localCommit,
+    localMessage,
+    remoteCommit,
+    aheadCommits,
+    dirtyFiles,
+    remoteError
+  };
+}
+async function sendOrEditGitUpdateMenuInTelegram(chatId, messageId, replyToMessageId, notice) {
+  if (!isMasterAdminChat(chatId)) {
+    await sendTelegramStatusMessage(
+      chatId,
+      `\u26D4 <i>La actualizaci\xF3n del bot desde GitHub est\xE1 reservada para el Administrador Principal.</i>`,
+      replyToMessageId
+    );
+    return;
+  }
+  const status = await inspectGitUpdateStatus(true);
+  const supervisorActive = process.env.PICTA_WORKER_MODE === "1";
+  const activeOps = (activeUploadJobId ? 1 : 0) + (activeDownloadJobId ? 1 : 0);
+  const pendingCommitsBlock = status.aheadCommits.length > 0 ? `
+${hudSection(`Cambios Nuevos en GitHub (${status.aheadCommits.length})`)}
+<blockquote>${status.aheadCommits.slice(0, 8).map((c) => `\u2022 <code>${escapeHtml(c.slice(0, 95))}</code>`).join("\n")}</blockquote>` : "";
+  const dirtyBlock = status.dirtyFiles.length > 0 ? `
+\u26A0\uFE0F <b>Archivos modificados localmente (${status.dirtyFiles.length}):</b> <code>${escapeHtml(status.dirtyFiles.slice(0, 3).join(", "))}</code>` : "";
+  const errBlock = status.remoteError ? `
+\u26A0\uFE0F <b>Aviso Git:</b> <code>${escapeHtml(status.remoteError.slice(0, 180))}</code>` : "";
+  const textOut = (notice ? `${notice}
+
+` : "") + `${hudHeader("ACTUALIZADOR REMOTO · GITHUB")}
+` + hudBox([
+    `\u{1F33F} <b>Rama:</b> <code>${escapeHtml(status.branch)}</code> \xB7 <b>Commit actual:</b> <code>${escapeHtml(status.localCommit || "N/A")}</code>`,
+    status.localMessage ? `\u{1F4DD} <b>\xDAltima versi\xF3n local:</b> ${escapeHtml(status.localMessage.slice(0, 85))}` : null,
+    status.remoteCommit ? status.aheadCommits.length > 0 ? `\u{1F195} <b>Disponible en GitHub:</b> <code>${escapeHtml(status.remoteCommit)}</code> (${status.aheadCommits.length} commit(s) nuevos)` : `\u2705 <b>Estado GitHub:</b> Al d\xEDa (<code>${escapeHtml(status.remoteCommit)}</code>)` : null,
+    `\u{1F4E6} <b>Actividad actual:</b> ${activeOps > 0 ? `\u26A0\uFE0F ${activeOps} transferencia(s) en curso` : "\u{1F7E2} Libre (0 subidas/descargas activas)"} \xB7 Cola: ${uploadQueue.length}`,
+    `\u267B\uFE0F <b>Auto-reinicio en contenedor:</b> ${supervisorActive ? "\u{1F7E2} Supervisor activo (reinicio instant\xE1neo)" : IS_PREVIEW_INSTANCE ? "\u2139\uFE0F Modo Preview" : "\u26A0\uFE0F Proceso directo (depende del panel)"}`
+  ]) + pendingCommitsBlock + dirtyBlock + errBlock + `
+
+<i>\u{1F4A1} Pulsa abajo para hacer <code>git pull</code> desde GitHub y reiniciar el bot con el c\xF3digo nuevo.</i>`;
+  const keyboard = [];
+  if (status.hasGit) {
+    keyboard.push([
+      {
+        text: status.aheadCommits.length > 0 ? `\u{1F680} Actualizar (${status.aheadCommits.length} nuevos) y Reiniciar` : "\u{1F680} Forzar Git Pull y Reiniciar",
+        callback_data: "botupd:run"
+      }
+    ]);
+  }
+  keyboard.push([
+    { text: "\u{1F50D} Buscar Cambios", callback_data: "botupd:check" },
+    { text: "\u267B\uFE0F Solo Reiniciar", callback_data: "botupd:restart" }
+  ]);
+  keyboard.push([
+    { text: "\u{1FA7A} Ver Errores", callback_data: "errlog:open" },
+    { text: "\u25C8 Men\xFA Principal", callback_data: "cmd_start" }
+  ]);
+  if (messageId) {
+    await editTelegramStatusMessage(chatId, messageId, textOut, keyboard, true);
+  } else {
+    await sendTelegramStatusMessage(chatId, textOut, replyToMessageId, keyboard);
+  }
+}
+async function performGracefulRestartExit(exitCode = PICTA_RESTART_EXIT_CODE) {
+  pollingActive = false;
+  keepAliveActive = false;
+  try {
+    flushProcessedUpdatesToDiskNow();
+    saveJobsToDisk();
+    saveUserSessionsToDisk();
+    saveQuotaSettingsToDisk();
+    saveAuthorizedUsersToDisk();
+    savePinnedSeriesToDisk();
+    saveErrorSentinelToDisk();
+    if (!IS_PREVIEW_INSTANCE) {
+      await Promise.race([
+        saveCloudStateToTelegramNow(),
+        new Promise((r) => setTimeout(r, 3500))
+      ]).catch(() => {
+      });
+    }
+    await disconnectAuxiliaryBotClients(false);
+    if (mtprotoClient) {
+      await Promise.race([
+        mtprotoClient.disconnect(),
+        new Promise((r) => setTimeout(r, 1500))
+      ]).catch(() => {
+      });
+    }
+  } catch {
+  } finally {
+    if (activeHttpServerRef && typeof activeHttpServerRef.close === "function") {
+      try {
+        activeHttpServerRef.close(() => {
+          process.exit(exitCode);
+        });
+      } catch {
+        process.exit(exitCode);
+      }
+      setTimeout(() => process.exit(exitCode), 1200).unref();
+    } else {
+      setTimeout(() => process.exit(exitCode), 300).unref();
+    }
+  }
+}
+async function executeGitPullAndRestart(chatId, messageId, restartOnly = false) {
+  if (!isMasterAdminChat(chatId)) return;
+  if (botUpdateInProgress) {
+    await sendOrEditGitUpdateMenuInTelegram(
+      chatId,
+      messageId,
+      void 0,
+      "\u23F3 <i>Ya hay una actualizaci\xF3n o reinicio en progreso. Espera unos segundos...</i>"
+    );
+    return;
+  }
+  botUpdateInProgress = true;
+  try {
+    if (restartOnly) {
+      await editTelegramStatusMessage(
+        chatId,
+        messageId,
+        `${hudHeader("REINICIANDO BOT")}
+` + hudBox([`\u267B\uFE0F Guardando sesiones, cola y estado antes de reiniciar...`]),
+        void 0,
+        true
+      );
+      const curInfo = await inspectGitUpdateStatus(false);
+      const noticePayload = {
+        chatId,
+        oldCommit: curInfo.localCommit || "N/A",
+        newCommit: curInfo.localCommit || "N/A",
+        branch: curInfo.branch || "main",
+        commitsSummary: ["Reinicio manual limpio sin cambios de Git"],
+        restartOnly: true,
+        requestedAt: (/* @__PURE__ */ new Date()).toISOString()
+      };
+      fs3.writeFileSync(PENDING_UPDATE_NOTICE_FILE, JSON.stringify(noticePayload, null, 2), "utf-8");
+      mirrorFileToLegacyDataDir(PENDING_UPDATE_NOTICE_FILE);
+      void performGracefulRestartExit(PICTA_RESTART_EXIT_CODE);
+      return;
+    }
+    await editTelegramStatusMessage(
+      chatId,
+      messageId,
+      `${hudHeader("ACTUALIZANDO DESDE GITHUB · 1/3")}
+` + hudBox([`\u23F3 Descargando referencias desde <code>origin</code>...`]),
+      void 0,
+      true
+    );
+    const beforeInfo = await inspectGitUpdateStatus(true);
+    if (!beforeInfo.hasGit) {
+      botUpdateInProgress = false;
+      await sendOrEditGitUpdateMenuInTelegram(
+        chatId,
+        messageId,
+        void 0,
+        "\u274C <b>No se encontr\xF3 carpeta <code>.git</code> en este servidor.</b>"
+      );
+      return;
+    }
+    const beforeHeadRes = await runGitCommandSafe(["rev-parse", "HEAD"]);
+    const beforeHeadFull = beforeHeadRes.stdout;
+    await editTelegramStatusMessage(
+      chatId,
+      messageId,
+      `${hudHeader("ACTUALIZANDO DESDE GITHUB · 2/3")}
+` + hudBox([`\u2B07\uFE0F Ejecutando <code>git pull --ff-only origin ${escapeHtml(beforeInfo.branch)}</code>...`]),
+      void 0,
+      true
+    );
+    const pullRes = await runGitCommandSafe(["pull", "--ff-only", "origin", beforeInfo.branch], 45e3);
+    const afterHeadRes = await runGitCommandSafe(["rev-parse", "HEAD"]);
+    const afterHeadFull = afterHeadRes.stdout;
+    const afterShortRes = await runGitCommandSafe(["rev-parse", "--short", "HEAD"]);
+    const afterShort = afterShortRes.stdout || beforeInfo.localCommit;
+    if (beforeHeadFull === afterHeadFull) {
+      botUpdateInProgress = false;
+      await sendOrEditGitUpdateMenuInTelegram(
+        chatId,
+        messageId,
+        void 0,
+        `\u2705 <b>El repositorio ya estaba al d\xEDa</b> en el commit <code>${escapeHtml(afterShort)}</code>. No fue necesario reiniciar.`
+      );
+      return;
+    }
+    let changedFiles = [];
+    try {
+      const diffRes = await runGitCommandSafe(["diff", "--name-only", beforeHeadFull, afterHeadFull]);
+      changedFiles = diffRes.stdout ? diffRes.stdout.split("\n").map((s) => s.trim()).filter(Boolean) : [];
+    } catch {
+    }
+    const pkgChanged = changedFiles.some((f) => f === "package.json" || f === "package-lock.json");
+    if (pkgChanged) {
+      await editTelegramStatusMessage(
+        chatId,
+        messageId,
+        `${hudHeader("ACTUALIZANDO DESDE GITHUB · 3/3")}
+` + hudBox([`\u{1F4E6} Detectados cambios en dependencias. Ejecutando <code>npm install</code>...`]),
+        void 0,
+        true
+      );
+      await execFileAsync("npm", ["install", "--no-audit", "--no-fund"], {
+        cwd: process.cwd(),
+        timeout: 12e4,
+        maxBuffer: 4 * 1024 * 1024
+      });
+    }
+    let appliedCommits = beforeInfo.aheadCommits;
+    if (appliedCommits.length === 0) {
+      try {
+        const logApplied = await runGitCommandSafe(["log", `${beforeHeadFull}..${afterHeadFull}`, "--oneline", "-n", "10"]);
+        if (logApplied.stdout) {
+          appliedCommits = logApplied.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+        }
+      } catch {
+      }
+    }
+    const noticePayload = {
+      chatId,
+      oldCommit: beforeInfo.localCommit,
+      newCommit: afterShort,
+      branch: beforeInfo.branch,
+      commitsSummary: appliedCommits.slice(0, 8),
+      pkgInstalled: pkgChanged,
+      pullOutput: pullRes.stdout.slice(0, 220),
+      requestedAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    fs3.writeFileSync(PENDING_UPDATE_NOTICE_FILE, JSON.stringify(noticePayload, null, 2), "utf-8");
+    mirrorFileToLegacyDataDir(PENDING_UPDATE_NOTICE_FILE);
+    await editTelegramStatusMessage(
+      chatId,
+      messageId,
+      `${hudHeader("ACTUALIZACI\xD3N DESCARGADA · REINICIANDO")}
+` + hudBox([
+        `\u2705 <b>Git Pull completado:</b> <code>${escapeHtml(beforeInfo.localCommit)}</code> \u27A1\uFE0F <code>${escapeHtml(afterShort)}</code>`,
+        pkgChanged ? `\u{1F4E6} <b>Dependencias:</b> Actualizadas con <code>npm install</code>` : null,
+        `\u267B\uFE0F <b>Estado:</b> Guardando b\xF3veda y relanzando proceso ahora...`
+      ]) + `
+<i>Te avisar\xE9 en cuanto el bot est\xE9 en l\xEDnea con la nueva versi\xF3n.</i>`,
+      void 0,
+      true
+    );
+    void performGracefulRestartExit(PICTA_RESTART_EXIT_CODE);
+  } catch (err) {
+    botUpdateInProgress = false;
+    const errMsg = sanitizeAlertOutputText(err instanceof Error ? err.message : String(err));
+    addLiveLog("updater", "error", `Error actualizando desde GitHub: ${errMsg}`);
+    await sendOrEditGitUpdateMenuInTelegram(
+      chatId,
+      messageId,
+      void 0,
+      `\u274C <b>Error al actualizar desde GitHub:</b>\n<code>${escapeHtml(errMsg.slice(0, 260))}</code>`
+    );
+  }
+}
+async function maybeNotifyPostUpdateRestart() {
+  try {
+    let noticePath = "";
+    const legacyNotice = path3.join(LEGACY_DATA_DIR, "pending_update_notice.json");
+    if (fs3.existsSync(PENDING_UPDATE_NOTICE_FILE)) {
+      noticePath = PENDING_UPDATE_NOTICE_FILE;
+    } else if (fs3.existsSync(legacyNotice)) {
+      noticePath = legacyNotice;
+    }
+    if (!noticePath) return;
+    const raw = fs3.readFileSync(noticePath, "utf-8");
+    try {
+      if (fs3.existsSync(PENDING_UPDATE_NOTICE_FILE)) fs3.unlinkSync(PENDING_UPDATE_NOTICE_FILE);
+      if (fs3.existsSync(legacyNotice)) fs3.unlinkSync(legacyNotice);
+    } catch {
+    }
+    const info = JSON.parse(raw);
+    if (!info?.requestedAt) return;
+    const ageMs = Date.now() - new Date(info.requestedAt).getTime();
+    if (!Number.isFinite(ageMs) || ageMs > 15 * 60 * 1e3) return;
+    const targetChat = String(info.chatId || MASTER_ADMIN_CHAT_ID);
+    const commits = Array.isArray(info.commitsSummary) ? info.commitsSummary : [];
+    const headerTitle = info.restartOnly ? "BOT REINICIADO Y EN L\xCDNEA" : "BOT ACTUALIZADO DESDE GITHUB Y EN L\xCDNEA";
+    const msgHtml = `${hudHeader(headerTitle)}
+` + hudBox([
+      info.restartOnly ? `\u267B\uFE0F <b>Reinicio limpio completado</b> (commit <code>${escapeHtml(info.newCommit || "N/A")}</code>)` : `\u{1F680} <b>Versi\xF3n activa:</b> <code>${escapeHtml(info.oldCommit || "?")}</code> \u27A1\uFE0F <code>${escapeHtml(info.newCommit || "?")}</code> (<code>${escapeHtml(info.branch || "main")}</code>)`,
+      info.pkgInstalled ? `\u{1F4E6} <b>Dependencias:</b> Sincronizadas correctamente` : null,
+      `\u{1F4CB} <b>Cola restaurada:</b> ${uploadQueue.length} trabajo(s) \xB7 \u{1FA7A} <b>Centinela de errores:</b> ${errorSentinelSettings.enabled ? "\u{1F7E2} Activo" : "\u{1F534} Pausado"}`
+    ]) + (commits.length > 0 && !info.restartOnly ? `
+${hudSection("Cambios aplicados")}
+<blockquote>${commits.slice(0, 6).map((c) => `\u2022 <code>${escapeHtml(String(c).slice(0, 95))}</code>`).join("\n")}</blockquote>` : "");
+    await sendTelegramStatusMessage(targetChat, msgHtml, void 0, [
+      [
+        { text: "\u{1FA7A} Centinela (/errores)", callback_data: "errlog:open" },
+        { text: "\u25C8 Men\xFA Principal", callback_data: "cmd_start" }
+      ]
+    ]);
+  } catch {
   }
 }
 function formatBytes(bytes) {
@@ -12430,7 +13109,19 @@ async function sendOrEditMainMenuInTelegram(chatId, messageId, replyToMessageId)
         text: `\u26A1 Cuota (${usedToday}/${totalDailyCap})`,
         callback_data: "quota_menu"
       }
-    ]
+    ],
+    ...isMaster ? [
+      [
+        {
+          text: "\u{1FA7A} Errores (/errores)",
+          callback_data: "errlog:open"
+        },
+        {
+          text: "\u{1F504} Actualizar Bot",
+          callback_data: "botupd:open"
+        }
+      ]
+    ] : []
   ];
   if (!isMaster && !session) {
     startKeyboard.unshift([
@@ -15611,7 +16302,9 @@ async function scanAllPictaAlertsAndMilestones(onlyChatId) {
         checked++;
         totalComments += r.newComments;
         totalMilestones += r.newMilestones;
-      } catch {
+      } catch (alertErr) {
+        const msg = alertErr instanceof Error ? alertErr.message : String(alertErr);
+        addLiveLog("alerts", "warn", `Fallo escaneando logros/comentarios en ${t.channelName}: ${msg}`);
       }
     }
   } finally {
@@ -20367,6 +21060,93 @@ Esta acci\xF3n eliminar\xE1 o retirar\xE1 el cap\xEDtulo/video de tu canal en Pi
       );
       return;
     }
+    if (data === "errlog:open" || data === "errlog:netlog" || data === "errlog:toggle" || data === "errlog:warnings" || data.startsWith("errlog:mute:") || data === "errlog:test" || data === "errlog:clear") {
+      if (!isMasterAdminChat(chatId2)) {
+        await callTelegramBotApi("answerCallbackQuery", {
+          callback_query_id: cq.id,
+          text: "\u26D4 Solo el Administrador Principal puede gestionar el centinela de errores.",
+          show_alert: true
+        }).catch(() => {
+        });
+        return;
+      }
+      if (data === "errlog:netlog") {
+        await callTelegramBotApi("answerCallbackQuery", { callback_query_id: cq.id, text: "Actualizando log MTProto..." }).catch(() => {});
+        await sendOrEditMtprotoDiagInTelegram(chatId2, messageId);
+        return;
+      }
+      let noticeMsg;
+      if (data === "errlog:toggle") {
+        errorSentinelSettings.enabled = !errorSentinelSettings.enabled;
+        saveErrorSentinelToDisk();
+        noticeMsg = errorSentinelSettings.enabled ? "\u{1F7E2} <b>Alertas autom\xE1ticas activadas.</b>" : "\u{1F534} <b>Alertas autom\xE1ticas desactivadas.</b>";
+        await callTelegramBotApi("answerCallbackQuery", {
+          callback_query_id: cq.id,
+          text: errorSentinelSettings.enabled ? "Alertas activadas" : "Alertas desactivadas"
+        }).catch(() => {});
+      } else if (data === "errlog:warnings") {
+        errorSentinelSettings.includeWarnings = !errorSentinelSettings.includeWarnings;
+        saveErrorSentinelToDisk();
+        noticeMsg = errorSentinelSettings.includeWarnings ? "\u26A0\uFE0F <b>Modo estricto activado:</b> te avisar\xE1 de cualquier fallo o anomal\xEDa real." : "\u{1F6A8} <b>Modo solo errores cr\xEDticos activado.</b>";
+        await callTelegramBotApi("answerCallbackQuery", { callback_query_id: cq.id, text: "Sensibilidad actualizada" }).catch(() => {});
+      } else if (data.startsWith("errlog:mute:")) {
+        const mins = Number(data.slice("errlog:mute:".length) || 0);
+        errorSentinelSettings.mutedUntilMs = mins > 0 ? Date.now() + mins * 60 * 1e3 : 0;
+        saveErrorSentinelToDisk();
+        noticeMsg = mins > 0 ? `\u{1F515} <b>Alertas silenciadas por ${mins} min.</b> Los errores se seguir\xE1n guardando en el historial.` : "\u{1F514} <b>Alertas reactivadas de inmediato.</b>";
+        await callTelegramBotApi("answerCallbackQuery", {
+          callback_query_id: cq.id,
+          text: mins > 0 ? `Silenciado ${mins} min` : "Alertas reactivadas"
+        }).catch(() => {});
+      } else if (data === "errlog:test") {
+        await callTelegramBotApi("answerCallbackQuery", { callback_query_id: cq.id, text: "Enviando alerta de prueba..." }).catch(() => {});
+        recordAndMaybeAlertError("prueba", "error", "Prueba manual del Centinela Autom\xE1tico de Errores: el sistema de avisos funciona correctamente.", true);
+        noticeMsg = "\u{1F9EA} <b>Alerta de prueba enviada a tu chat privado.</b>";
+      } else if (data === "errlog:clear") {
+        errorSentinelSettings.recentEvents = [];
+        errorAlertDedupMap.clear();
+        saveErrorSentinelToDisk();
+        noticeMsg = "\u{1F9F9} <b>Historial de errores limpiado.</b>";
+        await callTelegramBotApi("answerCallbackQuery", { callback_query_id: cq.id, text: "Historial limpiado" }).catch(() => {});
+      } else {
+        await callTelegramBotApi("answerCallbackQuery", { callback_query_id: cq.id }).catch(() => {});
+      }
+      await sendOrEditErrorSentinelMenuInTelegram(chatId2, messageId, void 0, noticeMsg);
+      return;
+    }
+    if (data === "botupd:open" || data === "botupd:check" || data === "botupd:run" || data === "botupd:restart") {
+      if (!isMasterAdminChat(chatId2)) {
+        await callTelegramBotApi("answerCallbackQuery", {
+          callback_query_id: cq.id,
+          text: "\u26D4 Solo el Administrador Principal puede actualizar o reiniciar el bot.",
+          show_alert: true
+        }).catch(() => {
+        });
+        return;
+      }
+      if (data === "botupd:run") {
+        await callTelegramBotApi("answerCallbackQuery", {
+          callback_query_id: cq.id,
+          text: "\u{1F680} Iniciando actualizaci\xF3n desde GitHub..."
+        }).catch(() => {});
+        await executeGitPullAndRestart(chatId2, messageId, false);
+        return;
+      }
+      if (data === "botupd:restart") {
+        await callTelegramBotApi("answerCallbackQuery", {
+          callback_query_id: cq.id,
+          text: "\u267B\uFE0F Reiniciando proceso del bot..."
+        }).catch(() => {});
+        await executeGitPullAndRestart(chatId2, messageId, true);
+        return;
+      }
+      await callTelegramBotApi("answerCallbackQuery", {
+        callback_query_id: cq.id,
+        text: data === "botupd:check" ? "Consultando GitHub..." : "Abriendo actualizador GitHub..."
+      }).catch(() => {});
+      await sendOrEditGitUpdateMenuInTelegram(chatId2, messageId);
+      return;
+    }
     if (data === "quota_menu") {
       pendingPoolAccountByChat.delete(chatId2);
       await callTelegramBotApi("answerCallbackQuery", {
@@ -23088,6 +23868,14 @@ Escribe ahora el t\xEDtulo que pidi\xF3 el suscriptor (o usa <code>/pedir Nombre
     await sendOrEditDiskManagerInTelegram(chatId, void 0, msg.message_id);
     return;
   }
+  if (text.startsWith("/errores") || text.startsWith("/logs")) {
+    await sendOrEditErrorSentinelMenuInTelegram(chatId, void 0, msg.message_id);
+    return;
+  }
+  if (text.startsWith("/actualizar") || text.startsWith("/update") || text.startsWith("/gitpull") || text.startsWith("/reiniciar")) {
+    await sendOrEditGitUpdateMenuInTelegram(chatId, void 0, msg.message_id);
+    return;
+  }
   if (text.startsWith("/reintentar") || text.startsWith("/retry")) {
     const failedJob = transferJobs.find(
       (j) => j.telegramChatId === chatId && (j.stage === "failed" || j.stage !== "completed" && j.stage !== "cancelled" && Boolean(j.minioKey))
@@ -23957,6 +24745,7 @@ async function startPollingBridge() {
     "info",
     "Receptor \xFAnico de Telegram activo con deduplicaci\xF3n en /tmp/picta_bot_state."
   );
+  let consecutivePollErrors = 0;
   while (pollingActive && myGeneration === pollingLoopGeneration && !externalCloudRunWebhookActive) {
     try {
       const updates = await callTelegramBotApi("getUpdates", {
@@ -23964,6 +24753,10 @@ async function startPollingBridge() {
         timeout: 15,
         allowed_updates: ["message", "edited_message", "channel_post", "callback_query"]
       });
+      if (consecutivePollErrors >= 3) {
+        addLiveLog("telegram", "success", `Polling de Telegram recuperado tras ${consecutivePollErrors} fallo(s).`);
+      }
+      consecutivePollErrors = 0;
       if (Array.isArray(updates) && updates.length > 0) {
         for (const upd of updates) {
           const nextOffset = Number(upd.update_id) + 1;
@@ -23971,10 +24764,20 @@ async function startPollingBridge() {
             lastUpdateOffset = nextOffset;
             saveProcessedUpdatesToDisk();
           }
-          await handleTelegramUpdate(upd);
+          try {
+            await handleTelegramUpdate(upd);
+          } catch (updErr) {
+            const updMsg = updErr instanceof Error ? updErr.message : String(updErr);
+            addLiveLog("telegram", "error", `Error procesando actualizaci\xF3n #${upd?.update_id || "?"}: ${updMsg}`);
+          }
         }
       }
-    } catch {
+    } catch (pollErr) {
+      consecutivePollErrors++;
+      const pMsg = pollErr instanceof Error ? pollErr.message : String(pollErr);
+      if (consecutivePollErrors === 3 || consecutivePollErrors % 12 === 0 || /401|409|unauthorized|conflict/i.test(pMsg)) {
+        addLiveLog("telegram", "error", `Fallo en getUpdates de Telegram (x${consecutivePollErrors}): ${pMsg}`);
+      }
       await new Promise((r) => setTimeout(r, 2e3));
     }
   }
@@ -23996,63 +24799,76 @@ async function initTelegramListener() {
     const hookInfo = await callTelegramBotApi("getWebhookInfo");
     const currentHookUrl = String(hookInfo.url || "").trim();
     if (!IS_PREVIEW_INSTANCE) {
+      const publicBotCommands = [
+        {
+          command: "buscar",
+          description: "\u{1F50E} Buscar si una pel\xEDcula, serie o video ya existe en Picta"
+        },
+        {
+          command: "canal",
+          description: "\u{1F3DB}\uFE0F Editar mi Canal de Picta (Nombre, Lema, Avatar, Portada)"
+        },
+        {
+          command: "series",
+          description: "\u{1F4FA} Series de mi Canal y \u{1F4CC} Modo Serie Fija (R\xE1faga)"
+        },
+        {
+          command: "cola",
+          description: "\u{1F4CB} Ver Cola de Espera, Modo R\xE1faga y Cancelar Subidas"
+        },
+        {
+          command: "cuota",
+          description: "\u26A1 Dividir Cuota Diaria (10/d\xEDa) y Pool Multi-Cuenta (+10/cuenta)"
+        },
+        {
+          command: "stats",
+          description: "\u{1F4CA} Dashboard de Picta y Edici\xF3n de Videos Publicados"
+        },
+        {
+          command: "auditoria",
+          description: "\u{1FA7A} Auditar duplicados internos, faltantes y salud de tu canal"
+        },
+        {
+          command: "pedidos",
+          description: "\u{1F4E5} Gestor de pedidos y verificador r\xE1pido en Picta"
+        },
+        {
+          command: "canalpedidos",
+          description: "\u{1F4E2} Configurar Canal/Grupo de Pedidos y auto-verificador"
+        },
+        {
+          command: "logros",
+          description: "\u{1F3C6} Alertas de Comentarios y Metas de Reproducciones/Likes"
+        },
+        {
+          command: "cuenta",
+          description: "\u{1F6E1}\uFE0F Estado y permisos Jefe de canal de tu cuenta Picta"
+        },
+        {
+          command: "menu",
+          description: "\u{1F7E2} Men\xFA principal y estado del bot"
+        },
+        {
+          command: "reintentar",
+          description: "\u{1F504} Reintentar \xFAltima publicaci\xF3n pendiente"
+        }
+      ];
       void callTelegramBotApi("setMyCommands", {
-        commands: [
-          {
-            command: "buscar",
-            description: "\u{1F50E} Buscar si una pel\xEDcula, serie o video ya existe en Picta"
-          },
-          {
-            command: "canal",
-            description: "\u{1F3DB}\uFE0F Editar mi Canal de Picta (Nombre, Lema, Avatar, Portada)"
-          },
-          {
-            command: "series",
-            description: "\u{1F4FA} Series de mi Canal y \u{1F4CC} Modo Serie Fija (R\xE1faga)"
-          },
-          {
-            command: "cola",
-            description: "\u{1F4CB} Ver Cola de Espera, Modo R\xE1faga y Cancelar Subidas"
-          },
-          {
-            command: "cuota",
-            description: "\u26A1 Dividir Cuota Diaria (10/d\xEDa) y Pool Multi-Cuenta (+10/cuenta)"
-          },
-          {
-            command: "stats",
-            description: "\u{1F4CA} Dashboard de Picta y Edici\xF3n de Videos Publicados"
-          },
-          {
-            command: "auditoria",
-            description: "\u{1FA7A} Auditar duplicados internos, faltantes y salud de tu canal"
-          },
-          {
-            command: "pedidos",
-            description: "\u{1F4E5} Gestor de pedidos y verificador r\xE1pido en Picta"
-          },
-          {
-            command: "canalpedidos",
-            description: "\u{1F4E2} Configurar Canal/Grupo de Pedidos y auto-verificador"
-          },
-          {
-            command: "logros",
-            description: "\u{1F3C6} Alertas de Comentarios y Metas de Reproducciones/Likes"
-          },
-          {
-            command: "cuenta",
-            description: "\u{1F6E1}\uFE0F Estado y permisos Jefe de canal de tu cuenta Picta"
-          },
-          {
-            command: "menu",
-            description: "\u{1F7E2} Men\xFA principal y estado del bot"
-          },
-          {
-            command: "reintentar",
-            description: "\u{1F504} Reintentar \xFAltima publicaci\xF3n pendiente"
-          }
-        ]
+        commands: publicBotCommands
       }).catch(() => {
       });
+      void callTelegramBotApi("setMyCommands", {
+        commands: [
+          ...publicBotCommands,
+          { command: "disco", description: "\u{1F4BD} Uso de disco del host y cach\xE9 temporal" },
+          { command: "errores", description: "\u{1FA7A} Centinela autom\xE1tico de errores y alertas" },
+          { command: "actualizar", description: "\u{1F504} Actualizar bot desde GitHub y reiniciar" },
+          { command: "netlog", description: "\u{1F4E1} Diagn\xF3stico de red y sockets MTProto" }
+        ],
+        scope: { type: "chat", chat_id: Number(MASTER_ADMIN_CHAT_ID) }
+      }).catch(() => {
+      });
+      void maybeNotifyPostUpdateRestart();
       const baseWebhookDomain = detectCloudRunUrl();
       const targetUrl = baseWebhookDomain ? `${baseWebhookDomain}/api/telegram/webhook` : "";
       const isPlaceholderUrl = !baseWebhookDomain || targetUrl.includes("placeholder.ai.studio") || targetUrl.includes("untitled-3150.ai.studio");
@@ -24839,7 +25655,8 @@ async function startServer() {
             `Guardi\xE1n peri\xF3dico scratch (15 min): ${resClean.removedCount} archivo(s) residuales eliminados (${formatBytes(resClean.freedBytes)} liberados).`
           );
         }
-      } catch {
+      } catch (err) {
+        addLiveLog("worker", "error", `Error en guardi\xE1n de disco scratch: ${err instanceof Error ? err.message : String(err)}`);
       }
     }, 15 * 60 * 1e3);
     if (typeof scratchCleanupInterval.unref === "function") {
@@ -24855,7 +25672,8 @@ async function startServer() {
         if (hasDueEncoderRetry) {
           void scheduleTransferPipeline();
         }
-      } catch {
+      } catch (err) {
+        addLiveLog("worker", "error", `Error en ciclo de reintento de codificador: ${err instanceof Error ? err.message : String(err)}`);
       }
     }, 20 * 1e3);
     if (typeof encoderRetryInterval.unref === "function") {
@@ -24884,7 +25702,8 @@ async function startServer() {
             void scheduleTransferPipeline();
           }
         }
-      } catch {
+      } catch (err) {
+        addLiveLog("worker", "error", `Error en reinicio diario de cuota Cuba: ${err instanceof Error ? err.message : String(err)}`);
       }
     }, 30 * 1e3);
     if (typeof midnightCubaResetInterval.unref === "function") {
@@ -24951,6 +25770,7 @@ async function startServer() {
       }
     });
   });
+  activeHttpServerRef = httpServer;
   httpServer.keepAliveTimeout = 65e3;
   httpServer.headersTimeout = 66e3;
   let shuttingDown = false;
@@ -24967,6 +25787,7 @@ async function startServer() {
       saveQuotaSettingsToDisk();
       saveAuthorizedUsersToDisk();
       savePinnedSeriesToDisk();
+      saveErrorSentinelToDisk();
       if (!IS_PREVIEW_INSTANCE) {
         await Promise.race([
           saveCloudStateToTelegramNow(),
@@ -24997,4 +25818,89 @@ async function startServer() {
     void handleGracefulShutdown("SIGINT");
   });
 }
-void startServer();
+function installGlobalRuntimeErrorHooks() {
+  process.on("unhandledRejection", (reason) => {
+    const msg = reason instanceof Error ? `${reason.message}${reason.stack ? ` | ${reason.stack.split("\n").slice(0, 3).join(" <- ")}` : ""}` : String(reason);
+    console.error("[Runtime] unhandledRejection:", sanitizeAlertOutputText(msg));
+    addLiveLog("runtime", "error", `Promesa rechazada sin capturar: ${msg}`);
+  });
+  process.on("uncaughtException", (err) => {
+    const msg = err instanceof Error ? `${err.message}${err.stack ? ` | ${err.stack.split("\n").slice(0, 3).join(" <- ")}` : ""}` : String(err);
+    console.error("[Runtime] uncaughtException:", sanitizeAlertOutputText(msg));
+    addLiveLog("runtime", "error", `Excepci\xF3n cr\xEDtica de ejecuci\xF3n: ${msg}`);
+    try {
+      saveJobsToDisk();
+      saveErrorSentinelToDisk();
+    } catch {
+    }
+  });
+}
+function shouldRunAsSupervisor() {
+  if (IS_PREVIEW_INSTANCE) return false;
+  if (Boolean(K_SERVICE_NAME)) return false;
+  if (process.env.PICTA_WORKER_MODE === "1") return false;
+  if (process.env.PICTA_NO_SUPERVISOR === "1") return false;
+  const entryScript = String(process.argv[1] || "");
+  if (!entryScript) return false;
+  return true;
+}
+function runSupervisedWorkerLoop() {
+  let activeChild = null;
+  let stopping = false;
+  const spawnWorker = () => {
+    if (stopping) return;
+    const args = [...process.execArgv, ...process.argv.slice(1)];
+    const child = spawn(process.execPath, args, {
+      cwd: process.cwd(),
+      stdio: "inherit",
+      env: {
+        ...process.env,
+        PICTA_WORKER_MODE: "1"
+      }
+    });
+    activeChild = child;
+    child.on("exit", (code, signal) => {
+      activeChild = null;
+      if (stopping) {
+        process.exit(typeof code === "number" ? code : 0);
+        return;
+      }
+      if (code === PICTA_RESTART_EXIT_CODE) {
+        console.log("[Supervisor] Reinicio solicitado tras actualizaci\xF3n. Relanzando bot en 400ms...");
+        setTimeout(() => {
+          spawnWorker();
+        }, 400);
+        return;
+      }
+      if (signal) {
+        process.exit(1);
+        return;
+      }
+      process.exit(typeof code === "number" ? code : 0);
+    });
+  };
+  const forwardSignal = (sig) => {
+    stopping = true;
+    if (activeChild && !activeChild.killed) {
+      try {
+        activeChild.kill(sig);
+      } catch {
+      }
+      setTimeout(() => process.exit(0), 5e3).unref();
+    } else {
+      process.exit(0);
+    }
+  };
+  process.once("SIGTERM", () => forwardSignal("SIGTERM"));
+  process.once("SIGINT", () => forwardSignal("SIGINT"));
+  spawnWorker();
+}
+function bootEntrypoint() {
+  if (shouldRunAsSupervisor()) {
+    runSupervisedWorkerLoop();
+    return;
+  }
+  installGlobalRuntimeErrorHooks();
+  void startServer();
+}
+bootEntrypoint();
